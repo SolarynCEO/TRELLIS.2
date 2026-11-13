@@ -7,8 +7,13 @@ from PIL import Image
 import trimesh
 import trimesh.visual
 from flex_gemm.ops.grid_sample import grid_sample_3d
-import nvdiffrast.torch as dr
 import cumesh
+from .zyrex_baker_backend import resolve_baker_backend
+
+try:
+    import nvdiffrast.torch as dr
+except Exception:
+    dr = None
 
 
 def to_glb(
@@ -225,45 +230,103 @@ def to_glb(
         pbar.set_description("Sampling attributes")
     if verbose:
         print("Sampling attributes...", end='', flush=True)
-        
-    # Setup differentiable rasterizer context
-    ctx = dr.RasterizeCudaContext()
-    # Prepare UV coordinates for rasterization (rendering in UV space)
-    uvs_rast = torch.cat([out_uvs * 2 - 1, torch.zeros_like(out_uvs[:, :1]), torch.ones_like(out_uvs[:, :1])], dim=-1).unsqueeze(0)
-    rast = torch.zeros((1, texture_size, texture_size, 4), device='cuda', dtype=torch.float32)
-    
-    # Rasterize in chunks to save memory
-    for i in range(0, out_faces.shape[0], 100000):
-        rast_chunk, _ = dr.rasterize(
-            ctx, uvs_rast, out_faces[i:i+100000],
-            resolution=[texture_size, texture_size],
+    backend = resolve_baker_backend()
+    if backend in ("pytorch3d", "kaolin"):
+        raise NotImplementedError(
+            f"ZYREX_BAKER={backend!r} is reserved but not implemented. "
+            "Use ZYREX_BAKER=nvdiffrast (default) or ZYREX_BAKER=zyrex."
         )
-        mask_chunk = rast_chunk[..., 3:4] > 0
-        rast_chunk[..., 3:4] += i # Store face ID in alpha channel
-        rast = torch.where(mask_chunk, rast_chunk, rast)
-    
-    # Mask of valid pixels in texture
-    mask = rast[0, ..., 3] > 0
-    
-    # Interpolate 3D positions in UV space (finding 3D coord for every texel)
-    pos = dr.interpolate(out_vertices.unsqueeze(0), rast, out_faces)[0][0]
-    valid_pos = pos[mask]
-    
-    # Map these positions back to the *original* high-res mesh to get accurate attributes
-    # This corrects geometric errors introduced by simplification/remeshing
-    _, face_id, uvw = bvh.unsigned_distance(valid_pos, return_uvw=True)
-    orig_tri_verts = vertices[faces[face_id.long()]] # (N_new, 3, 3)
-    valid_pos = (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
-    
-    # Trilinear sampling from the attribute volume (Color, Material props)
-    attrs = torch.zeros(texture_size, texture_size, attr_volume.shape[1], device='cuda')
-    attrs[mask] = grid_sample_3d(
-        attr_volume,
-        torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=-1),
-        shape=torch.Size([1, attr_volume.shape[1], *grid_size.tolist()]),
-        grid=((valid_pos - aabb[0]) / voxel_size).reshape(1, -1, 3),
-        mode='trilinear',
-    )
+
+    normal_map = None
+    if backend == "zyrex":
+        from .zyrex_uv_baker import bake_voxel_pbr_maps
+
+        out_normals_t = out_normals
+        if not isinstance(out_normals_t, torch.Tensor):
+            out_normals_t = torch.as_tensor(out_normals_t, dtype=torch.float32, device=out_vertices.device)
+        else:
+            out_normals_t = out_normals_t.to(out_vertices.device, dtype=torch.float32)
+
+        def map_to_original_surface(query_positions: torch.Tensor) -> torch.Tensor:
+            if query_positions.shape[0] == 0:
+                return query_positions
+            _, face_id, uvw = bvh.unsigned_distance(query_positions, return_uvw=True)
+            orig_tri_verts = vertices[faces[face_id.long()]]
+            return (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
+
+        baked = bake_voxel_pbr_maps(
+            vertices=out_vertices,
+            faces=out_faces.long(),
+            uvs=out_uvs,
+            vertex_normals=out_normals_t,
+            attr_volume=attr_volume,
+            coords=coords,
+            attr_layout=attr_layout,
+            aabb=aabb,
+            voxel_size=voxel_size,
+            grid_size=grid_size,
+            texture_size=texture_size,
+            seam_padding_iterations=8,
+            position_mapper=map_to_original_surface,
+        )
+        mask = baked["mask"].cpu().numpy()
+        base_color = torch.clamp(baked["base_color"] * 255.0, 0.0, 255.0).byte().cpu().numpy()
+        metallic = torch.clamp(baked["metallic"] * 255.0, 0.0, 255.0).byte().cpu().numpy()
+        roughness = torch.clamp(baked["roughness"] * 255.0, 0.0, 255.0).byte().cpu().numpy()
+        alpha = torch.clamp(baked["alpha"] * 255.0, 0.0, 255.0).byte().cpu().numpy()
+        normal_map = torch.clamp(baked["normal"] * 255.0, 0.0, 255.0).byte().cpu().numpy()
+    else:
+        if dr is None:
+            raise ImportError("nvdiffrast is required for ZYREX_BAKER=nvdiffrast but is not importable.")
+
+        # Setup differentiable rasterizer context
+        ctx = dr.RasterizeCudaContext()
+        # Prepare UV coordinates for rasterization (rendering in UV space)
+        uvs_rast = torch.cat([out_uvs * 2 - 1, torch.zeros_like(out_uvs[:, :1]), torch.ones_like(out_uvs[:, :1])], dim=-1).unsqueeze(0)
+        rast = torch.zeros((1, texture_size, texture_size, 4), device='cuda', dtype=torch.float32)
+
+        # Rasterize in chunks to save memory
+        for i in range(0, out_faces.shape[0], 100000):
+            rast_chunk, _ = dr.rasterize(
+                ctx, uvs_rast, out_faces[i:i+100000],
+                resolution=[texture_size, texture_size],
+            )
+            mask_chunk = rast_chunk[..., 3:4] > 0
+            rast_chunk[..., 3:4] += i  # Store face ID in alpha channel
+            rast = torch.where(mask_chunk, rast_chunk, rast)
+
+        # Mask of valid pixels in texture
+        mask = rast[0, ..., 3] > 0
+
+        # Interpolate 3D positions in UV space (finding 3D coord for every texel)
+        pos = dr.interpolate(out_vertices.unsqueeze(0), rast, out_faces)[0][0]
+        valid_pos = pos[mask]
+
+        # Map these positions back to the *original* high-res mesh to get accurate attributes
+        # This corrects geometric errors introduced by simplification/remeshing
+        _, face_id, uvw = bvh.unsigned_distance(valid_pos, return_uvw=True)
+        orig_tri_verts = vertices[faces[face_id.long()]]  # (N_new, 3, 3)
+        valid_pos = (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
+
+        # Trilinear sampling from the attribute volume (Color, Material props)
+        attrs = torch.zeros(texture_size, texture_size, attr_volume.shape[1], device='cuda')
+        attrs[mask] = grid_sample_3d(
+            attr_volume,
+            torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=-1),
+            shape=torch.Size([1, attr_volume.shape[1], *grid_size.tolist()]),
+            grid=((valid_pos - aabb[0]) / voxel_size).reshape(1, -1, 3),
+            mode='trilinear',
+        )
+        mask = mask.cpu().numpy()
+        base_color = np.clip(attrs[..., attr_layout['base_color']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
+        metallic = np.clip(attrs[..., attr_layout['metallic']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
+        roughness = np.clip(attrs[..., attr_layout['roughness']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
+        alpha = np.clip(attrs[..., attr_layout['alpha']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
+        mask_inv = (~mask).astype(np.uint8)
+        base_color = cv2.inpaint(base_color, mask_inv, 3, cv2.INPAINT_TELEA)
+        metallic = cv2.inpaint(metallic, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
+        roughness = cv2.inpaint(roughness, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
+        alpha = cv2.inpaint(alpha, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
     if use_tqdm:
         pbar.update(1)
     if verbose:
@@ -275,22 +338,15 @@ def to_glb(
     if verbose:
         print("Finalizing mesh...", end='', flush=True)
     
-    mask = mask.cpu().numpy()
-    
-    # Extract channels based on layout (BaseColor, Metallic, Roughness, Alpha)
-    base_color = np.clip(attrs[..., attr_layout['base_color']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
-    metallic = np.clip(attrs[..., attr_layout['metallic']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
-    roughness = np.clip(attrs[..., attr_layout['roughness']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
-    alpha = np.clip(attrs[..., attr_layout['alpha']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
     alpha_mode = 'OPAQUE'
-    
-    # Inpainting: fill gaps (dilation) to prevent black seams at UV boundaries
-    mask_inv = (~mask).astype(np.uint8)
-    base_color = cv2.inpaint(base_color, mask_inv, 3, cv2.INPAINT_TELEA)
-    metallic = cv2.inpaint(metallic, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
-    roughness = cv2.inpaint(roughness, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
-    alpha = cv2.inpaint(alpha, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
-    
+
+    if metallic.ndim == 2:
+        metallic = metallic[..., None]
+    if roughness.ndim == 2:
+        roughness = roughness[..., None]
+    if alpha.ndim == 2:
+        alpha = alpha[..., None]
+
     # Create PBR material
     # Standard PBR packs Metallic and Roughness into Blue and Green channels
     material = trimesh.visual.material.PBRMaterial(
@@ -302,6 +358,8 @@ def to_glb(
         alphaMode=alpha_mode,
         doubleSided=True if not remesh else False,
     )
+    if normal_map is not None:
+        setattr(material, "normalTexture", Image.fromarray(normal_map))
     
     # --- Coordinate System Conversion & Final Object ---
     vertices_np = out_vertices.cpu().numpy()
