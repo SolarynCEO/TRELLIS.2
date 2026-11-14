@@ -59,3 +59,29 @@ Script: `trellis2/utils/zyrex_baker_compare.py`
 - Optional real-asset UV re-bake sanity check from GLB textures
 - GPU side-by-side mode skeleton for `nvdiffrast` vs `zyrex` with fixed seeds and JSON metrics output
 - On non-CUDA hosts, all GPU metrics are emitted as **`pending GPU run`** (never estimated)
+
+### Windows laptop command (RTX 4070 Laptop 8 GB, CUDA 12.4, torch 2.6)
+
+Run from the repository root in PowerShell:
+
+```powershell
+$env:ZYREX_LOW_VRAM = "1"
+$env:PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
+
+py -3 trellis2\utils\zyrex_baker_compare.py `
+  --output "outputs\benchmarks\zyrex_gpu_compare_2048.json" `
+  --real-asset "C:\path\to\pipeline_or_real_asset.glb" `
+  --run-gpu `
+  --texture-size 2048 `
+  --synthetic-texture-size 128 `
+  --skip-rendered-views `
+  --gpu-artifacts-dir "outputs\benchmarks\zyrex_gpu_compare_2048_artifacts"
+```
+
+Expected outputs:
+
+- JSON metrics including time, peak VRAM (allocated/reserved), seam coverage, and map error vs `nvdiffrast`
+- Side-by-side PNGs (`nvdiffrast | zyrex | amplified abs diff`) for:
+  - base color
+  - metallic/roughness
+  - normal maps

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import Callable, Dict, Optional, Sequence, Tuple
 
 import torch
@@ -12,6 +13,12 @@ class UVRasterization:
     mask: torch.Tensor
     face_indices: torch.Tensor
     barycentric: torch.Tensor
+
+
+def _is_truthy(value: Optional[str]) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() not in {"", "0", "false", "no", "off"}
 
 
 def _to_texture_hw(texture_size: int | Sequence[int]) -> Tuple[int, int]:
@@ -119,6 +126,7 @@ def sample_sparse_volume_trilinear(
     aabb: torch.Tensor,
     voxel_size: torch.Tensor,
     query_positions: torch.Tensor,
+    chunk_size: Optional[int] = None,
 ) -> torch.Tensor:
     if query_positions.shape[0] == 0:
         return torch.zeros((0, attr_volume.shape[-1]), dtype=attr_volume.dtype, device=attr_volume.device)
@@ -127,32 +135,78 @@ def sample_sparse_volume_trilinear(
     dtype = attr_volume.dtype
     grid_size_t = torch.as_tensor(grid_size, dtype=torch.long, device=device)
     coords_t = coords.to(device=device, dtype=torch.long)
+    attrs_t = attr_volume.to(device=device, dtype=dtype)
 
-    dense = torch.zeros((1, attr_volume.shape[-1], *grid_size_t.tolist()), dtype=dtype, device=device)
-    dense[0, :, coords_t[:, 0], coords_t[:, 1], coords_t[:, 2]] = attr_volume.to(device=device, dtype=dtype).transpose(0, 1)
+    if chunk_size is None:
+        chunk_size = 131072 if _is_truthy(os.environ.get("ZYREX_LOW_VRAM")) else 524288
+    chunk_size = max(int(chunk_size), 1)
+
+    gx = int(grid_size_t[0].item())
+    gy = int(grid_size_t[1].item())
+    gz = int(grid_size_t[2].item())
+    stride_y = gz
+    stride_x = gy * gz
+
+    sparse_keys = coords_t[:, 0] * stride_x + coords_t[:, 1] * stride_y + coords_t[:, 2]
+    sort_idx = torch.argsort(sparse_keys)
+    sparse_keys_sorted = sparse_keys[sort_idx]
+    sparse_attrs_sorted = attrs_t[sort_idx]
 
     query = ((query_positions.to(device=device, dtype=dtype) - aabb[0].to(device=device, dtype=dtype)) / voxel_size.to(device=device, dtype=dtype))
     query = torch.clamp(query, min=0.0)
-    query[:, 0] = torch.clamp(query[:, 0], max=float(grid_size_t[0] - 1))
-    query[:, 1] = torch.clamp(query[:, 1], max=float(grid_size_t[1] - 1))
-    query[:, 2] = torch.clamp(query[:, 2], max=float(grid_size_t[2] - 1))
+    query[:, 0] = torch.clamp(query[:, 0], max=float(gx - 1))
+    query[:, 1] = torch.clamp(query[:, 1], max=float(gy - 1))
+    query[:, 2] = torch.clamp(query[:, 2], max=float(gz - 1))
 
-    grid = torch.stack(
-        [
-            _normalize_index(query[:, 2], int(grid_size_t[2].item())),  # x <- z
-            _normalize_index(query[:, 1], int(grid_size_t[1].item())),  # y <- y
-            _normalize_index(query[:, 0], int(grid_size_t[0].item())),  # z <- x
-        ],
-        dim=-1,
-    ).view(1, 1, -1, 1, 3)
-    sampled = F.grid_sample(
-        dense,
-        grid,
-        mode="bilinear",
-        padding_mode="border",
-        align_corners=True,
-    )
-    return sampled[0, :, 0, :, 0].transpose(0, 1).contiguous()
+    out = torch.zeros((query.shape[0], attrs_t.shape[-1]), dtype=dtype, device=device)
+
+    def corner_values(keys_1d: torch.Tensor) -> torch.Tensor:
+        idx = torch.searchsorted(sparse_keys_sorted, keys_1d)
+        in_bounds = idx < sparse_keys_sorted.shape[0]
+        valid = torch.zeros_like(in_bounds)
+        if in_bounds.any():
+            valid[in_bounds] = sparse_keys_sorted[idx[in_bounds]] == keys_1d[in_bounds]
+        values = torch.zeros((keys_1d.shape[0], attrs_t.shape[-1]), dtype=dtype, device=device)
+        if valid.any():
+            values[valid] = sparse_attrs_sorted[idx[valid]]
+        return values
+
+    for start in range(0, query.shape[0], chunk_size):
+        q = query[start : start + chunk_size]
+
+        x0 = torch.floor(q[:, 0]).long()
+        y0 = torch.floor(q[:, 1]).long()
+        z0 = torch.floor(q[:, 2]).long()
+        x1 = torch.clamp(x0 + 1, max=gx - 1)
+        y1 = torch.clamp(y0 + 1, max=gy - 1)
+        z1 = torch.clamp(z0 + 1, max=gz - 1)
+
+        wx = (q[:, 0] - x0.to(dtype)).unsqueeze(-1)
+        wy = (q[:, 1] - y0.to(dtype)).unsqueeze(-1)
+        wz = (q[:, 2] - z0.to(dtype)).unsqueeze(-1)
+        ix0 = 1.0 - wx
+        iy0 = 1.0 - wy
+        iz0 = 1.0 - wz
+
+        corners = (
+            (x0, y0, z0, ix0 * iy0 * iz0),
+            (x0, y0, z1, ix0 * iy0 * wz),
+            (x0, y1, z0, ix0 * wy * iz0),
+            (x0, y1, z1, ix0 * wy * wz),
+            (x1, y0, z0, wx * iy0 * iz0),
+            (x1, y0, z1, wx * iy0 * wz),
+            (x1, y1, z0, wx * wy * iz0),
+            (x1, y1, z1, wx * wy * wz),
+        )
+
+        chunk_out = torch.zeros((q.shape[0], attrs_t.shape[-1]), dtype=dtype, device=device)
+        for cx, cy, cz, weight in corners:
+            keys = cx * stride_x + cy * stride_y + cz
+            chunk_out = chunk_out + corner_values(keys) * weight
+
+        out[start : start + q.shape[0]] = chunk_out
+
+    return out.contiguous()
 
 
 def dilate_texture(
@@ -262,6 +316,7 @@ def bake_voxel_pbr_maps(
     texture_size: int,
     seam_padding_iterations: int = 8,
     position_mapper: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    sample_chunk_size: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     raster = rasterize_uv_triangles(uvs, faces, texture_size)
     positions = interpolate_vertex_attributes(vertices, faces, raster)
@@ -276,6 +331,7 @@ def bake_voxel_pbr_maps(
         aabb=aabb,
         voxel_size=voxel_size,
         query_positions=query_positions,
+        chunk_size=sample_chunk_size,
     )
 
     attrs_tex = torch.zeros((texture_size, texture_size, attr_volume.shape[-1]), dtype=attr_volume.dtype, device=attr_volume.device)

@@ -12,9 +12,16 @@ from pathlib import Path
 from typing import Dict, Iterable, Optional, Tuple
 
 import numpy as np
+from PIL import Image
 import torch
+import torch.nn.functional as F
 
 ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+O_VOXEL_ROOT = ROOT / "o-voxel"
+if str(O_VOXEL_ROOT) not in sys.path:
+    sys.path.insert(0, str(O_VOXEL_ROOT))
 _ZYREX_UV_BAKER_PATH = ROOT / "o-voxel" / "o_voxel" / "zyrex_uv_baker.py"
 _ZYREX_SPEC = importlib.util.spec_from_file_location("zyrex_uv_baker_compare_impl", _ZYREX_UV_BAKER_PATH)
 if _ZYREX_SPEC is None or _ZYREX_SPEC.loader is None:
@@ -197,6 +204,113 @@ def _sample_texture(image: np.ndarray, uv: np.ndarray) -> np.ndarray:
 
 def _sample_texture_torch(image: np.ndarray, uv: np.ndarray) -> np.ndarray:
     return _sample_texture((np.clip(image, 0.0, 1.0) * 255.0).astype(np.uint8), uv)
+
+
+def _uv_to_grid(uv_map: torch.Tensor) -> torch.Tensor:
+    # uv -> grid_sample coordinates, image-space V is flipped.
+    u = uv_map[..., 0] * 2.0 - 1.0
+    v = (1.0 - uv_map[..., 1]) * 2.0 - 1.0
+    return torch.stack([u, v], dim=-1)
+
+
+def _sample_texture_map_torch(texture: torch.Tensor, uv_map: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    # texture: [H, W, C] in [0,1], uv_map: [H, W, 2], mask: [H, W]
+    tex = texture.permute(2, 0, 1).unsqueeze(0)  # [1,C,H,W]
+    grid = _uv_to_grid(uv_map).unsqueeze(0)  # [1,H,W,2]
+    sampled = F.grid_sample(
+        tex,
+        grid,
+        mode="bilinear",
+        padding_mode="border",
+        align_corners=True,
+    )[0].permute(1, 2, 0)
+    return sampled * mask.unsqueeze(-1).to(sampled.dtype)
+
+
+def _rasterize_uv_nvdiffrast(
+    uvs: torch.Tensor,
+    faces: torch.Tensor,
+    texture_size: int,
+):
+    import nvdiffrast.torch as dr
+
+    ctx = dr.RasterizeCudaContext(device=uvs.device)
+    uvs_clip = torch.cat(
+        [uvs * 2 - 1, torch.zeros_like(uvs[:, :1]), torch.ones_like(uvs[:, :1])],
+        dim=-1,
+    )[None]
+    rast, _ = dr.rasterize(ctx, uvs_clip, faces.int(), resolution=[texture_size, texture_size])
+    mask = rast[0, ..., 3] > 0
+    uv_map = dr.interpolate(uvs[None], rast, faces.int())[0][0]
+    uv_map = torch.nan_to_num(uv_map, nan=0.0, posinf=1.0, neginf=0.0)
+    uv_map = torch.clamp(uv_map, 0.0, 1.0)
+    return mask, uv_map
+
+
+def _bake_texture_maps_nvdiffrast(
+    uvs: torch.Tensor,
+    faces: torch.Tensor,
+    base_tex: torch.Tensor,
+    mr_tex: torch.Tensor,
+    normal_tex: torch.Tensor,
+    texture_size: int,
+) -> Dict[str, torch.Tensor]:
+    mask, uv_map = _rasterize_uv_nvdiffrast(uvs, faces, texture_size)
+    return {
+        "mask": mask,
+        "base_color": _sample_texture_map_torch(base_tex, uv_map, mask),
+        "metallic_roughness": _sample_texture_map_torch(mr_tex, uv_map, mask),
+        "normal": _sample_texture_map_torch(normal_tex, uv_map, mask),
+    }
+
+
+def _bake_texture_maps_zyrex(
+    uvs: torch.Tensor,
+    faces: torch.Tensor,
+    base_tex: torch.Tensor,
+    mr_tex: torch.Tensor,
+    normal_tex: torch.Tensor,
+    texture_size: int,
+) -> Dict[str, torch.Tensor]:
+    raster = rasterize_uv_triangles(uvs, faces.long(), texture_size)
+    uv_map = interpolate_vertex_attributes(uvs, faces.long(), raster)
+    mask = raster.mask
+    return {
+        "mask": mask,
+        "base_color": _sample_texture_map_torch(base_tex, uv_map, mask),
+        "metallic_roughness": _sample_texture_map_torch(mr_tex, uv_map, mask),
+        "normal": _sample_texture_map_torch(normal_tex, uv_map, mask),
+    }
+
+
+def _per_channel_error(pred: np.ndarray, target: np.ndarray, mask: np.ndarray) -> Dict[str, float]:
+    if pred.ndim != 3:
+        raise ValueError(f"expected [H,W,C], got {pred.shape}")
+    out: Dict[str, float] = {}
+    for channel in range(pred.shape[-1]):
+        p = pred[..., channel]
+        t = target[..., channel]
+        valid = mask
+        if valid.any():
+            diff = np.abs(p[valid] - t[valid])
+            out[f"ch{channel}_mae"] = float(np.mean(diff))
+            out[f"ch{channel}_rmse"] = float(np.sqrt(np.mean((p[valid] - t[valid]) ** 2)))
+        else:
+            out[f"ch{channel}_mae"] = 0.0
+            out[f"ch{channel}_rmse"] = 0.0
+    return out
+
+
+def _save_side_by_side_png(reference: np.ndarray, candidate: np.ndarray, out_path: Path) -> None:
+    ref_u8 = np.clip(reference * 255.0, 0, 255).astype(np.uint8)
+    cand_u8 = np.clip(candidate * 255.0, 0, 255).astype(np.uint8)
+    if ref_u8.shape[-1] == 1:
+        ref_u8 = np.repeat(ref_u8, 3, axis=-1)
+    if cand_u8.shape[-1] == 1:
+        cand_u8 = np.repeat(cand_u8, 3, axis=-1)
+    diff = np.clip(np.abs(cand_u8.astype(np.int16) - ref_u8.astype(np.int16)) * 4, 0, 255).astype(np.uint8)
+    panel = np.concatenate([ref_u8, cand_u8, diff], axis=1)
+    Image.fromarray(panel).save(out_path)
 
 
 def _rotation_matrix(yaw_deg: float, pitch_deg: float) -> np.ndarray:
@@ -450,6 +564,118 @@ def run_real_asset_rebake(
     return results
 
 
+def run_gpu_comparison_real_asset(
+    glb_path: Path,
+    texture_size: int,
+    output_dir: Path,
+) -> Dict[str, object]:
+    if not torch.cuda.is_available():
+        return {
+            "status": "pending GPU run",
+            "reason": "CUDA is required for --run-gpu real-asset comparison.",
+        }
+    try:
+        import nvdiffrast.torch as _  # noqa: F401
+    except Exception:
+        return {
+            "status": "pending GPU run",
+            "reason": "nvdiffrast is required for --run-gpu real-asset comparison.",
+        }
+
+    mesh = _extract_first_textured_mesh(glb_path)
+    material = mesh.visual.material
+    base = np.array(material.baseColorTexture.convert("RGBA"), dtype=np.float32) / 255.0
+    mr_tex = material.metallicRoughnessTexture
+    mr = np.array(mr_tex.convert("RGB"), dtype=np.float32) / 255.0 if mr_tex is not None else np.zeros((*base.shape[:2], 3), dtype=np.float32)
+    normal_tex = getattr(material, "normalTexture", None)
+    normal = np.array(normal_tex.convert("RGB"), dtype=np.float32) / 255.0 if normal_tex is not None else np.zeros((*base.shape[:2], 3), dtype=np.float32)
+    if normal_tex is None:
+        normal[..., 2] = 1.0
+
+    uvs = torch.from_numpy(mesh.visual.uv.astype(np.float32)).cuda()
+    faces = torch.from_numpy(mesh.faces.astype(np.int64)).cuda()
+    base_t = torch.from_numpy(base).cuda()
+    mr_t = torch.from_numpy(mr).cuda()
+    normal_t = torch.from_numpy(normal).cuda()
+
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    t0 = time.perf_counter()
+    nvd = _bake_texture_maps_nvdiffrast(uvs, faces, base_t, mr_t, normal_t, texture_size)
+    torch.cuda.synchronize()
+    nvd_time = time.perf_counter() - t0
+    nvd_alloc_mb = torch.cuda.max_memory_allocated() / (1024**2)
+    nvd_reserved_mb = torch.cuda.max_memory_reserved() / (1024**2)
+
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    t1 = time.perf_counter()
+    zyx = _bake_texture_maps_zyrex(uvs, faces, base_t, mr_t, normal_t, texture_size)
+    torch.cuda.synchronize()
+    zyx_time = time.perf_counter() - t1
+    zyx_alloc_mb = torch.cuda.max_memory_allocated() / (1024**2)
+    zyx_reserved_mb = torch.cuda.max_memory_reserved() / (1024**2)
+
+    nvd_mask = nvd["mask"].detach().cpu().numpy().astype(bool)
+    zyx_mask = zyx["mask"].detach().cpu().numpy().astype(bool)
+    union_mask = nvd_mask | zyx_mask
+    overlap_mask = nvd_mask & zyx_mask
+
+    nvd_base = nvd["base_color"].detach().cpu().numpy()
+    nvd_mr = nvd["metallic_roughness"].detach().cpu().numpy()
+    nvd_normal = nvd["normal"].detach().cpu().numpy()
+    zyx_base = zyx["base_color"].detach().cpu().numpy()
+    zyx_mr = zyx["metallic_roughness"].detach().cpu().numpy()
+    zyx_normal = zyx["normal"].detach().cpu().numpy()
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    png_paths = {
+        "base_color": output_dir / "gpu_compare_base_color_side_by_side.png",
+        "metallic_roughness": output_dir / "gpu_compare_metallic_roughness_side_by_side.png",
+        "normal": output_dir / "gpu_compare_normal_side_by_side.png",
+    }
+    _save_side_by_side_png(nvd_base, zyx_base, png_paths["base_color"])
+    _save_side_by_side_png(nvd_mr, zyx_mr, png_paths["metallic_roughness"])
+    _save_side_by_side_png(nvd_normal, zyx_normal, png_paths["normal"])
+
+    return {
+        "status": "measured",
+        "texture_size": texture_size,
+        "timing_seconds": {
+            "nvdiffrast": nvd_time,
+            "zyrex": zyx_time,
+        },
+        "peak_vram_mb": {
+            "nvdiffrast_allocated": nvd_alloc_mb,
+            "nvdiffrast_reserved": nvd_reserved_mb,
+            "zyrex_allocated": zyx_alloc_mb,
+            "zyrex_reserved": zyx_reserved_mb,
+        },
+        "seam_coverage": {
+            "nvdiffrast_ratio": float(nvd_mask.mean()),
+            "zyrex_ratio": float(zyx_mask.mean()),
+            "union_ratio": float(union_mask.mean()),
+            "overlap_ratio": float(overlap_mask.mean()),
+            "xor_ratio": float(np.logical_xor(nvd_mask, zyx_mask).mean()),
+        },
+        "map_metrics_vs_nvdiffrast": {
+            "base_color": {
+                **masked_metrics(zyx_base, nvd_base, union_mask),
+                **_per_channel_error(zyx_base, nvd_base, union_mask),
+            },
+            "metallic_roughness": {
+                **masked_metrics(zyx_mr, nvd_mr, union_mask),
+                **_per_channel_error(zyx_mr, nvd_mr, union_mask),
+            },
+            "normal": {
+                **masked_metrics(zyx_normal, nvd_normal, union_mask),
+                **_per_channel_error(zyx_normal, nvd_normal, union_mask),
+            },
+        },
+        "side_by_side_pngs": {k: str(v.resolve()) for k, v in png_paths.items()},
+    }
+
+
 def nvdiffrast_reference_bake(
     case: Dict[str, torch.Tensor],
     texture_size: int,
@@ -554,13 +780,38 @@ def run_gpu_comparison(texture_size: int) -> Dict[str, object]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="CPU/GPU comparison harness for the ZYREX UV baker prototype.")
     parser.add_argument("--output", type=Path, required=True, help="Path to write JSON metrics.")
-    parser.add_argument("--texture-size", type=int, default=128)
+    parser.add_argument("--texture-size", type=int, default=2048)
+    parser.add_argument("--synthetic-texture-size", type=int, default=128, help="Texture size for synthetic CPU validation case.")
     parser.add_argument("--real-asset", type=Path, default=None, help="Optional GLB path for real-asset re-bake sanity checks.")
     parser.add_argument("--run-gpu", action="store_true", help="Run nvdiffrast vs zyrex GPU comparison when available.")
     parser.add_argument("--render-resolution", type=int, default=192, help="CPU rendered-view resolution for real-asset comparison.")
     parser.add_argument("--render-max-faces", type=int, default=30000, help="Maximum faces to use for CPU rendered-view comparisons.")
     parser.add_argument("--skip-rendered-views", action="store_true", help="Skip CPU rendered-view comparison for real assets.")
+    parser.add_argument(
+        "--gpu-artifacts-dir",
+        type=Path,
+        default=None,
+        help="Optional directory for GPU comparison side-by-side PNG artifacts. Defaults next to --output.",
+    )
     args = parser.parse_args()
+
+    if args.gpu_artifacts_dir is None:
+        args.gpu_artifacts_dir = args.output.parent / f"{args.output.stem}_artifacts"
+
+    gpu_comparison = run_gpu_comparison(args.texture_size) if args.run_gpu else {
+        "status": "pending GPU run",
+        "reason": "Run again with --run-gpu on a CUDA machine with nvdiffrast installed.",
+        "map_metrics": "pending GPU run",
+        "rendered_view_metrics": "pending GPU run",
+        "processing_time_seconds": "pending GPU run",
+        "gpu_memory_mb": "pending GPU run",
+    }
+    if args.run_gpu and args.real_asset is not None:
+        gpu_comparison = run_gpu_comparison_real_asset(
+            glb_path=args.real_asset,
+            texture_size=args.texture_size,
+            output_dir=args.gpu_artifacts_dir,
+        )
 
     report: Dict[str, object] = {
         "hardware": {
@@ -569,15 +820,8 @@ def main() -> None:
             "cuda_available": torch.cuda.is_available(),
             "cuda_device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         },
-        "synthetic_cpu": run_synthetic_cpu(texture_size=args.texture_size),
-        "gpu_comparison": run_gpu_comparison(args.texture_size) if args.run_gpu else {
-            "status": "pending GPU run",
-            "reason": "Run again with --run-gpu on a CUDA machine with nvdiffrast installed.",
-            "map_metrics": "pending GPU run",
-            "rendered_view_metrics": "pending GPU run",
-            "processing_time_seconds": "pending GPU run",
-            "gpu_memory_mb": "pending GPU run",
-        },
+        "synthetic_cpu": run_synthetic_cpu(texture_size=args.synthetic_texture_size),
+        "gpu_comparison": gpu_comparison,
     }
     if args.real_asset is not None:
         report["real_asset"] = run_real_asset_rebake(

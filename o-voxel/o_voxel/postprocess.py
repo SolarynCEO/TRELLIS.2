@@ -1,4 +1,5 @@
 from typing import *
+import os
 from tqdm import tqdm
 import numpy as np
 import torch
@@ -14,6 +15,27 @@ try:
     import nvdiffrast.torch as dr
 except Exception:
     dr = None
+
+
+def _is_truthy(value: Optional[str]) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _resolve_zyrex_sample_chunk_size() -> int:
+    env_value = os.environ.get("ZYREX_BAKER_CHUNK_SIZE")
+    if env_value:
+        try:
+            parsed = int(env_value)
+            if parsed > 0:
+                return parsed
+        except ValueError:
+            pass
+    # Lower default chunk for 8GB profile.
+    if _is_truthy(os.environ.get("ZYREX_LOW_VRAM")):
+        return 65536
+    return 262144
 
 
 def to_glb(
@@ -231,6 +253,11 @@ def to_glb(
     if verbose:
         print("Sampling attributes...", end='', flush=True)
     backend = resolve_baker_backend()
+    if backend == "nvdiffrast" and dr is None:
+        raise ImportError(
+            "ZYREX_BAKER is set to 'nvdiffrast' (default), but nvdiffrast could not be imported. "
+            "Install/build nvdiffrast or set ZYREX_BAKER=zyrex."
+        )
     if backend in ("pytorch3d", "kaolin"):
         raise NotImplementedError(
             f"ZYREX_BAKER={backend!r} is reserved but not implemented. "
@@ -268,6 +295,7 @@ def to_glb(
             texture_size=texture_size,
             seam_padding_iterations=8,
             position_mapper=map_to_original_surface,
+            sample_chunk_size=_resolve_zyrex_sample_chunk_size(),
         )
         mask = baked["mask"].cpu().numpy()
         base_color = torch.clamp(baked["base_color"] * 255.0, 0.0, 255.0).byte().cpu().numpy()
@@ -276,9 +304,6 @@ def to_glb(
         alpha = torch.clamp(baked["alpha"] * 255.0, 0.0, 255.0).byte().cpu().numpy()
         normal_map = torch.clamp(baked["normal"] * 255.0, 0.0, 255.0).byte().cpu().numpy()
     else:
-        if dr is None:
-            raise ImportError("nvdiffrast is required for ZYREX_BAKER=nvdiffrast but is not importable.")
-
         # Setup differentiable rasterizer context
         ctx = dr.RasterizeCudaContext()
         # Prepare UV coordinates for rasterization (rendering in UV space)
