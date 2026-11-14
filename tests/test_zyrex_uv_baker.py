@@ -467,20 +467,27 @@ print(json.dumps(payload))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for real export-path parity test")
-def test_bake_glb_maps_from_prepared_zyrex_matches_nvdiffrast_tiny():
+def test_bake_glb_maps_from_prepared_zyrex_matches_nvdiffrast_tiny(monkeypatch):
     try:
         import nvdiffrast.torch as _  # noqa: F401
     except ModuleNotFoundError as exc:
         pytest.skip(f"Missing module: {exc.name}")
-    if importlib.util.find_spec("flex_gemm.ops.grid_sample") is None:
-        pytest.skip("Missing module: flex_gemm.ops.grid_sample")
+    try:
+        flex_grid_sample = importlib.import_module("flex_gemm.ops.grid_sample")
+    except ImportError as exc:
+        missing = exc.name or "flex_gemm.ops.grid_sample"
+        pytest.skip(f"Missing module: {missing}")
+    if not hasattr(flex_grid_sample, "grid_sample_3d"):
+        pytest.skip("Missing symbol: flex_gemm.ops.grid_sample.grid_sample_3d")
 
     # postprocess imports cumesh at module import time; this test path does not
     # execute any cumesh calls, so provide a lightweight stub when unavailable.
-    if importlib.util.find_spec("cumesh") is None and "cumesh" not in sys.modules:
+    try:
+        importlib.import_module("cumesh")
+    except ImportError:
         import types
 
-        sys.modules["cumesh"] = types.ModuleType("cumesh")
+        monkeypatch.setitem(sys.modules, "cumesh", types.ModuleType("cumesh"))
 
     post_module = importlib.import_module("o_voxel.postprocess")
 
