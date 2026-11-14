@@ -68,6 +68,7 @@ Status labels:
 | `nvdiffrast` | `setup.sh --nvdiffrast` | https://github.com/NVlabs/nvdiffrast | NVIDIA Source Code License (1-Way Commercial) | **⚠️ NON-COMMERCIAL LIMITATION in license text section 3.3** |
 | `nvdiffrec` (JeffreyXiang fork, `renderutils` branch) | `setup.sh --nvdiffrec` | https://github.com/JeffreyXiang/nvdiffrec | NVIDIA Source Code License for nvdiffrec | **⚠️ NON-COMMERCIAL LIMITATION in license text section 3.3** |
 | `flash-attn==2.7.3` | `setup.sh --flash-attn`; default attention backend | https://github.com/Dao-AILab/flash-attention | BSD-3-Clause | Permissive; generally allowed |
+| `triton-windows<3.3` (Windows only) | `scripts/windows/build_extensions.ps1`; required by FlexGEMM Triton kernels on Windows (`torch==2.6` pin) | https://pypi.org/project/triton-windows/ | MIT (PyPI metadata) | Permissive; generally allowed |
 | `xformers` (optional fallback backend) | Mentioned in README and attention config | https://github.com/facebookresearch/xformers | BSD 3-Clause text in repo `LICENSE` | Permissive; generally allowed |
 | `spconv` (optional sparse conv backend) | `SPARSE_CONV_BACKEND=spconv` path | https://github.com/traveller59/spconv | Apache-2.0 | Permissive; generally allowed |
 | `torchsparse` (optional sparse conv backend) | `SPARSE_CONV_BACKEND=torchsparse` path | https://github.com/mit-han-lab/torchsparse | MIT | Permissive; generally allowed |

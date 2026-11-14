@@ -18,7 +18,7 @@ torch::Tensor encode_sparse_voxel_octree_cpu(
     const torch::Tensor& codes,
     const uint32_t depth
 ) {
-    size_t N_leaf = codes.size(0);
+    const int64_t N_leaf = codes.size(0);
     int* codes_data = codes.data_ptr<int>();
     
     std::vector<uint8_t> svo;
@@ -32,7 +32,7 @@ torch::Tensor encode_sparse_voxel_octree_cpu(
     stack_ptr[0] = 0;
 
     // Iterate over all codes and encode them into SVO
-    for (int i = 0; i < N_leaf; i++) {
+    for (int64_t i = 0; i < N_leaf; i++) {
         code = codes_data[i];
 
         // Convert code to insert stack (3bit per level)
@@ -71,7 +71,11 @@ torch::Tensor encode_sparse_voxel_octree_cpu(
     }
 
     // Convert SVO to tensor
-    torch::Tensor svo_tensor = torch::from_blob(svo.data(), {svo.size()}, torch::kUInt8).clone();
+    torch::Tensor svo_tensor = torch::from_blob(
+        svo.data(),
+        {static_cast<int64_t>(svo.size())},
+        torch::kUInt8
+    ).clone();
     return svo_tensor;
 }
 
@@ -133,6 +137,10 @@ torch::Tensor decode_sparse_voxel_octree_cpu(
     // Decode SVO into list of codes
     decode_sparse_voxel_octree_cpu_recursive(octree_data, depth, ptr, stack, codes);
     // Convert codes to tensor
-    torch::Tensor codes_tensor = torch::from_blob(codes.data(), {codes.size()}, torch::kInt32).clone();
+    torch::Tensor codes_tensor = torch::from_blob(
+        codes.data(),
+        {static_cast<int64_t>(codes.size())},
+        torch::kInt32
+    ).clone();
     return codes_tensor;
 }

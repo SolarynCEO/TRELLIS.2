@@ -74,17 +74,27 @@ torch::Tensor encode_sparse_voxel_octree_attr_parent_cpu(
     const uint32_t depth,
     const torch::Tensor& attr
 ) {
-    size_t N_leaf = attr.size(0);
-    size_t N_node = octree.size(0);
-    size_t C = attr.size(1);
+    const int64_t N_leaf = attr.size(0);
+    const int64_t C = attr.size(1);
     uint8_t* octree_data = octree.data_ptr<uint8_t>();
     uint8_t* attr_data = attr.data_ptr<uint8_t>();
 
     torch::Tensor delta = torch::zeros({N_leaf, C}, torch::kUInt8);
     uint32_t svo_ptr = 0;
     uint32_t attr_ptr = 0;
-    uint32_t delta_ptr = C;
-    encode_recursive(octree_data, depth, attr_data, C, svo_ptr, attr_ptr, delta_ptr, 0, 0, delta.data_ptr<uint8_t>());
+    uint32_t delta_ptr = static_cast<uint32_t>(C);
+    encode_recursive(
+        octree_data,
+        depth,
+        attr_data,
+        static_cast<size_t>(C),
+        svo_ptr,
+        attr_ptr,
+        delta_ptr,
+        0,
+        0,
+        delta.data_ptr<uint8_t>()
+    );
 
     return delta;
 }
@@ -145,20 +155,28 @@ torch::Tensor decode_sparse_voxel_octree_attr_parent_cpu(
     const uint32_t depth,
     const torch::Tensor& delta
 ) {
-    size_t N_node = octree.size(0);
-    size_t N_leaf = delta.size(0);
-    size_t C = delta.size(1);
+    const int64_t N_leaf = delta.size(0);
+    const int64_t C = delta.size(1);
     uint8_t* octree_data = octree.data_ptr<uint8_t>();
     uint8_t* delta_data = delta.data_ptr<uint8_t>();
 
     torch::Tensor attr = torch::zeros({N_leaf, C}, torch::kUInt8);
     uint32_t svo_ptr = 0;
     uint32_t attr_ptr = 0;
-    uint32_t delta_ptr = C;
+    uint32_t delta_ptr = static_cast<uint32_t>(C);
 
     // Recursively decode the attribute
     decode_recursive(
-        octree_data, depth, delta_data, C, svo_ptr, attr_ptr, delta_ptr, 0, delta_data, attr.data_ptr<uint8_t>()
+        octree_data,
+        depth,
+        delta_data,
+        static_cast<size_t>(C),
+        svo_ptr,
+        attr_ptr,
+        delta_ptr,
+        0,
+        delta_data,
+        attr.data_ptr<uint8_t>()
     );
 
     return attr;
