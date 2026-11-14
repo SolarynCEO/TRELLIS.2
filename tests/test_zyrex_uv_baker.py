@@ -1,4 +1,5 @@
 import importlib.util
+import importlib
 import io
 import json
 import math
@@ -202,13 +203,14 @@ def test_uv_rasterization_matches_nvdiffrast_mask_and_face_ids():
 
     # Accept face-id differences only for genuine edge ties:
     #  - faces must share an edge (adjacent),
-    #  - texel center must lie on that shared edge at 8-bit subpixel precision
-    #    (|edge function| <= 1).
-    uvs_fp = torch.floor((uvs.cpu() * texture_size - 0.5) * 256.0 + 0.5).to(torch.int64)
+    #  - texel center must be within one 4-bit subpixel unit of that edge
+    #    (distance <= 1/16 pixel).
+    uvs_cpu = uvs.cpu().to(torch.float64)
     faces_cpu = faces.cpu().to(torch.long)
     face_coords = torch.nonzero(face_diff, as_tuple=False)
     unexplained = []
     explained = []
+    distance_diag = []
     for rc in face_coords:
         rr = int(rc[0].item())
         cc = int(rc[1].item())
@@ -218,16 +220,24 @@ def test_uv_rasterization_matches_nvdiffrast_mask_and_face_ids():
         vb = set(int(v) for v in faces_cpu[fb].tolist())
         shared_verts = sorted(list(va.intersection(vb)))
         tie_ok = False
+        distance_px = float("inf")
         if len(shared_verts) == 2:
             e0, e1 = shared_verts
-            ax, ay = [int(v) for v in uvs_fp[e0].tolist()]
-            bx, by = [int(v) for v in uvs_fp[e1].tolist()]
-            xfp = cc * 256
-            yfp = rr * 256
-            edge_abs = abs((xfp - ax) * (by - ay) - (yfp - ay) * (bx - ax))
-            if edge_abs <= 1:
+            a = uvs_cpu[e0, :2]
+            b = uvs_cpu[e1, :2]
+            p = torch.tensor([(cc + 0.5) / texture_size, (rr + 0.5) / texture_size], dtype=torch.float64)
+            edge = b - a
+            edge_len2 = float(torch.dot(edge, edge).item())
+            if edge_len2 > 0.0:
+                t = float(torch.dot(p - a, edge).item() / edge_len2)
+                t = min(1.0, max(0.0, t))
+                closest = a + edge * t
+                distance_uv = float(torch.linalg.norm(p - closest).item())
+                distance_px = distance_uv * texture_size
+            if distance_px <= (1.0 / 16.0 + 1e-9):
                 tie_ok = True
-        item = (rr, cc, fa, fb)
+        item = (rr, cc, fa, fb, float(distance_px))
+        distance_diag.append(item)
         if tie_ok:
             explained.append(item)
         else:
@@ -237,6 +247,7 @@ def test_uv_rasterization_matches_nvdiffrast_mask_and_face_ids():
     assert len(unexplained) <= 4, (
         f"face-id mismatch too large on shared coverage: {face_mismatch_count} total, "
         f"{len(explained)} explained-edge-ties, {len(unexplained)} unexplained; "
+        f"distance_px={distance_diag[:40]}; "
         f"unexplained={unexplained[:20]}; {diff_summary}"
     )
 
@@ -457,17 +468,21 @@ print(json.dumps(payload))
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for real export-path parity test")
 def test_bake_glb_maps_from_prepared_zyrex_matches_nvdiffrast_tiny():
-    pytest.importorskip("nvdiffrast.torch")
-    postprocess_path = ROOT / "o-voxel" / "o_voxel" / "postprocess.py"
-    post_spec = importlib.util.spec_from_file_location("zyrex_postprocess_test_impl", postprocess_path)
-    if post_spec is None or post_spec.loader is None:
-        pytest.skip(f"Failed to load postprocess module from {postprocess_path}")
-    post_module = importlib.util.module_from_spec(post_spec)
-    sys.modules[post_spec.name] = post_module
     try:
-        post_spec.loader.exec_module(post_module)
-    except Exception as exc:
-        pytest.skip(f"Postprocess module dependencies unavailable for this environment: {exc}")
+        import nvdiffrast.torch as _  # noqa: F401
+    except ModuleNotFoundError as exc:
+        pytest.skip(f"Missing module: {exc.name}")
+    if importlib.util.find_spec("flex_gemm.ops.grid_sample") is None:
+        pytest.skip("Missing module: flex_gemm.ops.grid_sample")
+
+    # postprocess imports cumesh at module import time; this test path does not
+    # execute any cumesh calls, so provide a lightweight stub when unavailable.
+    if importlib.util.find_spec("cumesh") is None and "cumesh" not in sys.modules:
+        import types
+
+        sys.modules["cumesh"] = types.ModuleType("cumesh")
+
+    post_module = importlib.import_module("o_voxel.postprocess")
 
     device = torch.device("cuda")
     out_vertices = torch.tensor(

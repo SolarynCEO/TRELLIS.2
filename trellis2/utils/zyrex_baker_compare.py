@@ -392,24 +392,70 @@ def _save_float_heat_png(values: np.ndarray, out_path: Path, valid_mask: Optiona
     Image.fromarray(np.clip(norm * 255.0, 0.0, 255.0).astype(np.uint8), mode="L").save(out_path)
 
 
-def _load_voxel_input(npz_path: Path) -> Dict[str, object]:
+def _load_voxel_input(npz_path: Path, allow_legacy_pickle: bool = False) -> Dict[str, object]:
+    def _decode_npz(data: np.lib.npyio.NpzFile) -> Dict[str, object]:
+        layout_json = str(data["attr_layout_json"][0])
+        layout_obj = json.loads(layout_json)
+        attr_layout = {k: slice(int(v[0]), int(v[1])) for k, v in layout_obj.items()}
+        to_glb_args = {}
+        if "to_glb_args_json" in data:
+            to_glb_args = json.loads(str(data["to_glb_args_json"][0]))
+        return {
+            "vertices": torch.from_numpy(data["vertices"]).float(),
+            "faces": torch.from_numpy(data["faces"]).to(torch.int32),
+            "attrs": torch.from_numpy(data["attrs"]).float(),
+            "coords": torch.from_numpy(data["coords"]).to(torch.int32),
+            "aabb": torch.from_numpy(data["aabb"]).float(),
+            "grid_size": torch.from_numpy(data["grid_size"]).to(torch.int32),
+            "voxel_size": torch.from_numpy(data["voxel_size"]).float(),
+            "attr_layout": attr_layout,
+            "to_glb_args": to_glb_args,
+        }
+
+    used_legacy_pickle = False
     data = np.load(npz_path, allow_pickle=False)
-    layout_json = str(data["attr_layout_json"][0])
-    layout_obj = json.loads(layout_json)
-    attr_layout = {k: slice(int(v[0]), int(v[1])) for k, v in layout_obj.items()}
-    to_glb_args = {}
-    if "to_glb_args_json" in data:
-        to_glb_args = json.loads(str(data["to_glb_args_json"][0]))
+    try:
+        out = _decode_npz(data)
+    except ValueError as exc:
+        if "Object arrays cannot be loaded when allow_pickle=False" not in str(exc):
+            raise
+        if not allow_legacy_pickle:
+            raise ValueError(
+                "Legacy voxel-input dump uses object arrays. For trusted local files only, re-run with "
+                "--allow-legacy-pickle, or convert once via --convert-legacy-dump <OUT.npz>."
+            ) from exc
+        data = np.load(npz_path, allow_pickle=True)
+        out = _decode_npz(data)
+        used_legacy_pickle = True
+
+    if used_legacy_pickle:
+        out["legacy_pickle_loaded"] = True
+    return out
+
+
+def _convert_legacy_voxel_input(in_path: Path, out_path: Path) -> Dict[str, object]:
+    voxel = _load_voxel_input(in_path, allow_legacy_pickle=True)
+    layout_meta = {
+        key: [int(sl.start), int(sl.stop)]
+        for key, sl in voxel["attr_layout"].items()
+    }
+    payload = {
+        "vertices": voxel["vertices"].cpu().numpy().astype(np.float32, copy=False),
+        "faces": voxel["faces"].cpu().numpy().astype(np.int32, copy=False),
+        "attrs": voxel["attrs"].cpu().numpy().astype(np.float32, copy=False),
+        "coords": voxel["coords"].cpu().numpy().astype(np.int32, copy=False),
+        "aabb": voxel["aabb"].cpu().numpy().astype(np.float32, copy=False),
+        "grid_size": voxel["grid_size"].cpu().numpy().astype(np.int32, copy=False),
+        "voxel_size": voxel["voxel_size"].cpu().numpy().astype(np.float32, copy=False),
+        "attr_layout_json": np.array([json.dumps(layout_meta)], dtype=np.str_),
+        "to_glb_args_json": np.array([json.dumps(voxel["to_glb_args"])], dtype=np.str_),
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(str(out_path), **payload)
     return {
-        "vertices": torch.from_numpy(data["vertices"]).float(),
-        "faces": torch.from_numpy(data["faces"]).to(torch.int32),
-        "attrs": torch.from_numpy(data["attrs"]).float(),
-        "coords": torch.from_numpy(data["coords"]).to(torch.int32),
-        "aabb": torch.from_numpy(data["aabb"]).float(),
-        "grid_size": torch.from_numpy(data["grid_size"]).to(torch.int32),
-        "voxel_size": torch.from_numpy(data["voxel_size"]).float(),
-        "attr_layout": attr_layout,
-        "to_glb_args": to_glb_args,
+        "input": str(in_path.resolve()),
+        "output": str(out_path.resolve()),
+        "status": "converted",
     }
 
 
@@ -823,6 +869,7 @@ def run_gpu_comparison_real_asset(
 def run_gpu_comparison_voxel_input(
     voxel_input_path: Path,
     output_dir: Path,
+    allow_legacy_pickle: bool = False,
 ) -> Dict[str, object]:
     started = time.perf_counter()
     if not torch.cuda.is_available():
@@ -839,7 +886,7 @@ def run_gpu_comparison_voxel_input(
         }
 
     _progress("gpu_voxel: loading voxel input", started)
-    voxel = _load_voxel_input(voxel_input_path)
+    voxel = _load_voxel_input(voxel_input_path, allow_legacy_pickle=allow_legacy_pickle)
     import o_voxel
     old_raster_profile = os.environ.get("ZYREX_RASTER_PROFILE")
     os.environ["ZYREX_RASTER_PROFILE"] = "1"
@@ -1291,10 +1338,34 @@ def main() -> None:
         default=None,
         help="Optional directory for GPU comparison side-by-side PNG artifacts. Defaults next to --output.",
     )
+    parser.add_argument(
+        "--allow-legacy-pickle",
+        action="store_true",
+        help=(
+            "Allow loading legacy voxel-input dumps that use NumPy object arrays. "
+            "WARNING: only use this for trusted local dumps."
+        ),
+    )
+    parser.add_argument(
+        "--convert-legacy-dump",
+        type=Path,
+        default=None,
+        help=(
+            "Convert --voxel-input into a safe non-object-array NPZ at this path, then exit. "
+            "Use this once to migrate old dumps."
+        ),
+    )
     args = parser.parse_args()
 
     if args.gpu_artifacts_dir is None:
         args.gpu_artifacts_dir = args.output.parent / f"{args.output.stem}_artifacts"
+
+    if args.convert_legacy_dump is not None:
+        if args.voxel_input is None:
+            parser.error("--convert-legacy-dump requires --voxel-input.")
+        conversion = _convert_legacy_voxel_input(args.voxel_input, args.convert_legacy_dump)
+        print(json.dumps(conversion, indent=2))
+        return
 
     if not args.run_gpu:
         gpu_comparison = {
@@ -1309,6 +1380,7 @@ def main() -> None:
         gpu_comparison = run_gpu_comparison_voxel_input(
             voxel_input_path=args.voxel_input,
             output_dir=args.gpu_artifacts_dir,
+            allow_legacy_pickle=args.allow_legacy_pickle,
         )
     elif args.real_asset is not None:
         gpu_comparison = run_gpu_comparison_real_asset(
