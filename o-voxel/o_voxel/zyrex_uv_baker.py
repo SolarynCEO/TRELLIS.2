@@ -53,7 +53,7 @@ def rasterize_uv_triangles(
     subpixel_bits = 8
     subpixel_scale = 1 << subpixel_bits
     area_eps = max(1, int(round(eps * (subpixel_scale**2))))
-    profiling_enabled = True
+    profiling_enabled = _is_truthy(os.environ.get("ZYREX_RASTER_PROFILE"))
     profile_sync = profiling_enabled and _is_truthy(os.environ.get("ZYREX_RASTER_PROFILE_SYNC")) and device.type == "cuda"
 
     timings: Dict[str, float] = {
@@ -95,15 +95,12 @@ def rasterize_uv_triangles(
     num_pixels = height * width
     best_face = torch.full((num_pixels,), -1, dtype=torch.int32, device=device)
     best_bary = torch.zeros((num_pixels, 3), dtype=dtype, device=device)
-    chunk_min_face = torch.empty((num_pixels,), dtype=torch.int32, device=device)
-    chunk_best_idx = torch.empty((num_pixels,), dtype=torch.long, device=device)
 
     def ceil_div(v: torch.Tensor, s: int) -> torch.Tensor:
         return -torch.div(-v, s, rounding_mode="floor")
 
     total_faces = tris.shape[0]
     start = 0
-    max_face_i32 = torch.iinfo(torch.int32).max
     max_idx_i64 = torch.iinfo(torch.int64).max
     while start < total_faces:
         stats["chunks"] += 1
@@ -204,9 +201,9 @@ def rasterize_uv_triangles(
 
         inside = (
             nondegenerate
-            & ((e0 < 0) | ((e0 == 0) & tl0))
-            & ((e1 < 0) | ((e1 == 0) & tl1))
-            & ((e2 < 0) | ((e2 == 0) & tl2))
+            & ((e0 < 0) | ((e0 == 0) & (~tl0)))
+            & ((e1 < 0) | ((e1 == 0) & (~tl1)))
+            & ((e2 < 0) | ((e2 == 0) & (~tl2)))
         )
         inside_count = int(inside.sum().item())
         stats["inside_count_total"] += inside_count
@@ -232,21 +229,17 @@ def rasterize_uv_triangles(
             b2 = bary[:, 2].clone()
             bary[:, 1] = torch.where(swapped_inside, b2, b1)
             bary[:, 2] = torch.where(swapped_inside, b1, b2)
-        large_idx = face_idx.shape[0]
-        chunk_min_face.fill_(max_face_i32)
-        chunk_min_face.scatter_reduce_(0, pix_idx, face_idx, reduce="amin", include_self=True)
-        is_best_face = face_idx == chunk_min_face[pix_idx]
+        unique_pix, inv = torch.unique(pix_idx, sorted=False, return_inverse=True)
         cand_idx = torch.arange(face_idx.shape[0], device=device, dtype=torch.long)
-        idx_for_pix = torch.where(is_best_face, cand_idx, torch.full_like(cand_idx, max_idx_i64))
-        chunk_best_idx.fill_(max_idx_i64)
-        chunk_best_idx.scatter_reduce_(0, pix_idx, idx_for_pix, reduce="amin", include_self=True)
-        valid_pix = chunk_best_idx < max_idx_i64
-        chosen_pix = torch.nonzero(valid_pix, as_tuple=False).squeeze(1)
-        if chosen_pix.numel() == 0:
+        best_idx_per_unique = torch.full((unique_pix.shape[0],), max_idx_i64, dtype=torch.long, device=device)
+        best_idx_per_unique.scatter_reduce_(0, inv, cand_idx, reduce="amin", include_self=True)
+        valid_unique = best_idx_per_unique < max_idx_i64
+        if not valid_unique.any():
             start = tentative_end
             continue
+        chosen_pix = unique_pix[valid_unique]
         stats["valid_pixel_total"] += int(chosen_pix.numel())
-        chosen_idx = chunk_best_idx[chosen_pix]
+        chosen_idx = best_idx_per_unique[valid_unique]
         chosen_face = face_idx[chosen_idx]
         chosen_bary = bary[chosen_idx]
         _stop_timer("winner_select", t)

@@ -841,6 +841,8 @@ def run_gpu_comparison_voxel_input(
     _progress("gpu_voxel: loading voxel input", started)
     voxel = _load_voxel_input(voxel_input_path)
     import o_voxel
+    old_raster_profile = os.environ.get("ZYREX_RASTER_PROFILE")
+    os.environ["ZYREX_RASTER_PROFILE"] = "1"
 
     to_glb_args = dict(voxel["to_glb_args"])
     decimation_target = int(to_glb_args.get("decimation_target", 500000))
@@ -939,11 +941,17 @@ def run_gpu_comparison_voxel_input(
             "median_reserved": float(np.median(np.array(reserveds))),
         }
 
-    nvd_runs = _run_voxel_backend("nvdiffrast")
-    zyx_runs = _run_voxel_backend("zyrex")
-    nvd_dbg = nvd_runs["debug"]
-    zyx_dbg = zyx_runs["debug"]
-    _progress("gpu_voxel: bake-only runs complete", started)
+    try:
+        nvd_runs = _run_voxel_backend("nvdiffrast")
+        zyx_runs = _run_voxel_backend("zyrex")
+        nvd_dbg = nvd_runs["debug"]
+        zyx_dbg = zyx_runs["debug"]
+        _progress("gpu_voxel: bake-only runs complete", started)
+    finally:
+        if old_raster_profile is None:
+            os.environ.pop("ZYREX_RASTER_PROFILE", None)
+        else:
+            os.environ["ZYREX_RASTER_PROFILE"] = old_raster_profile
 
     nvd_hashes = dict(nvd_dbg.get("hashes", {}))
     zyx_hashes = dict(zyx_dbg.get("hashes", {}))
