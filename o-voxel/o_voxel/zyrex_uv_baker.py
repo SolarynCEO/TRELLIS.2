@@ -42,13 +42,22 @@ def _to_texture_hw(texture_size: int | Sequence[int]) -> Tuple[int, int]:
 
 
 def _resolve_raster_impl(device: torch.device) -> str:
+    triton_interpret = _is_truthy(os.environ.get("TRITON_INTERPRET"))
+
+    def _triton_supported() -> bool:
+        if not _TRITON_AVAILABLE:
+            return False
+        if device.type == "cuda":
+            return True
+        # Triton's interpreter can execute kernels on CPU tensors for debugging.
+        return device.type == "cpu" and triton_interpret
+
     requested = os.environ.get("ZYREX_RASTER_IMPL", "").strip().lower()
     if requested in {"torch", "triton"}:
-        if requested == "triton" and (device.type != "cuda" or not _TRITON_AVAILABLE):
+        if requested == "triton" and not _triton_supported():
             return "torch"
         return requested
-    if device.type == "cuda" and _TRITON_AVAILABLE:
-        return "triton"
+    # Keep the production-safe path as the default until explicit parity is proven.
     return "torch"
 
 
@@ -286,14 +295,11 @@ def _rasterize_uv_triangles_torch(
 if _TRITON_AVAILABLE:
     @triton.jit
     def _rasterize_tile_atomic_min_kernel(
-        face_for_tile_ptr,
-        tile_local_ptr,
-        global_face_ptr,
-        min_x_ptr,
-        min_y_ptr,
+        face_global_ptr,
+        tile_x0_ptr,
+        tile_y0_ptr,
         max_x_ptr,
         max_y_ptr,
-        tiles_w_ptr,
         v0x_ptr,
         v0y_ptr,
         v1x_ptr,
@@ -311,39 +317,30 @@ if _TRITON_AVAILABLE:
         TILE_H: tl.constexpr,
     ):
         pid = tl.program_id(0)
-        face_local = tl.load(face_for_tile_ptr + pid)
-        tile_local = tl.load(tile_local_ptr + pid)
-        face_global = tl.load(global_face_ptr + face_local)
+        face_global = tl.load(face_global_ptr + pid)
+        x0 = tl.load(tile_x0_ptr + pid)
+        y0 = tl.load(tile_y0_ptr + pid)
+        max_x = tl.load(max_x_ptr + pid)
+        max_y = tl.load(max_y_ptr + pid)
 
-        tiles_w = tl.load(tiles_w_ptr + face_local)
-        tile_x = tile_local % tiles_w
-        tile_y = tile_local // tiles_w
-
-        min_x = tl.load(min_x_ptr + face_local)
-        min_y = tl.load(min_y_ptr + face_local)
-        max_x = tl.load(max_x_ptr + face_local)
-        max_y = tl.load(max_y_ptr + face_local)
-
-        x0 = min_x + tile_x * TILE_W
-        y0 = min_y + tile_y * TILE_H
-
-        x = x0 + tl.arange(0, TILE_W)[None, :]
-        y = y0 + tl.arange(0, TILE_H)[:, None]
+        lane = tl.arange(0, TILE_W * TILE_H)
+        x = x0 + (lane % TILE_W)
+        y = y0 + (lane // TILE_W)
 
         valid = (x <= max_x) & (y <= max_y) & (x >= 0) & (y >= 0) & (x < width) & (y < height)
 
         xfp = x.to(tl.int64) * subpixel_scale
         yfp = y.to(tl.int64) * subpixel_scale
 
-        v0x = tl.load(v0x_ptr + face_local)
-        v0y = tl.load(v0y_ptr + face_local)
-        v1x = tl.load(v1x_ptr + face_local)
-        v1y = tl.load(v1y_ptr + face_local)
-        v2x = tl.load(v2x_ptr + face_local)
-        v2y = tl.load(v2y_ptr + face_local)
-        include_e0 = tl.load(include_e0_ptr + face_local) != 0
-        include_e1 = tl.load(include_e1_ptr + face_local) != 0
-        include_e2 = tl.load(include_e2_ptr + face_local) != 0
+        v0x = tl.load(v0x_ptr + pid).to(tl.int64)
+        v0y = tl.load(v0y_ptr + pid).to(tl.int64)
+        v1x = tl.load(v1x_ptr + pid).to(tl.int64)
+        v1y = tl.load(v1y_ptr + pid).to(tl.int64)
+        v2x = tl.load(v2x_ptr + pid).to(tl.int64)
+        v2y = tl.load(v2y_ptr + pid).to(tl.int64)
+        include_e0 = tl.load(include_e0_ptr + pid) != 0
+        include_e1 = tl.load(include_e1_ptr + pid) != 0
+        include_e2 = tl.load(include_e2_ptr + pid) != 0
 
         e0 = (xfp - v1x) * (v2y - v1y) - (yfp - v1y) * (v2x - v1x)
         e1 = (xfp - v2x) * (v0y - v2y) - (yfp - v2y) * (v0x - v2x)
@@ -368,8 +365,9 @@ def _rasterize_uv_triangles_triton(
 ) -> UVRasterization:
     if not _TRITON_AVAILABLE:
         raise RuntimeError("Triton is not available")
-    if uvs.device.type != "cuda":
-        raise RuntimeError("Triton rasterizer requires CUDA tensors")
+    triton_interpret = _is_truthy(os.environ.get("TRITON_INTERPRET"))
+    if uvs.device.type != "cuda" and not (uvs.device.type == "cpu" and triton_interpret):
+        raise RuntimeError("Triton rasterizer requires CUDA tensors (or TRITON_INTERPRET=1 with CPU tensors)")
 
     height, width = _to_texture_hw(texture_size)
     device = uvs.device
@@ -492,25 +490,29 @@ def _rasterize_uv_triangles_triton(
         tile_local = (torch.arange(total_tiles, device=device, dtype=torch.long) - offsets_rep).to(torch.int32)
         global_faces = (start + local_ids).to(torch.int32)
 
+        tile_faces = global_faces[face_for_tile]
+        tiles_w_for_tile = tiles_w[face_for_tile]
+        tile_x = tile_local % tiles_w_for_tile
+        tile_y = torch.div(tile_local, tiles_w_for_tile, rounding_mode="floor")
+        tile_x0 = min_x_v[face_for_tile] + tile_x * tile_w
+        tile_y0 = min_y_v[face_for_tile] + tile_y * tile_h
+
         grid = (total_tiles,)
         _rasterize_tile_atomic_min_kernel[grid](
-            face_for_tile,
-            tile_local,
-            global_faces,
-            min_x_v,
-            min_y_v,
-            max_x_v,
-            max_y_v,
-            tiles_w,
-            v0[:, 0],
-            v0[:, 1],
-            v1[:, 0],
-            v1[:, 1],
-            v2[:, 0],
-            v2[:, 1],
-            include_e0,
-            include_e1,
-            include_e2,
+            tile_faces,
+            tile_x0,
+            tile_y0,
+            max_x_v[face_for_tile],
+            max_y_v[face_for_tile],
+            v0[:, 0][face_for_tile],
+            v0[:, 1][face_for_tile],
+            v1[:, 0][face_for_tile],
+            v1[:, 1][face_for_tile],
+            v2[:, 0][face_for_tile],
+            v2[:, 1][face_for_tile],
+            include_e0[face_for_tile],
+            include_e1[face_for_tile],
+            include_e2[face_for_tile],
             face_map,
             width=width,
             height=height,

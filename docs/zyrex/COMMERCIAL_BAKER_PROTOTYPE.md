@@ -32,7 +32,7 @@ Implemented modules:
 - `o-voxel/o_voxel/zyrex_baker_backend.py`
   - Resolves `ZYREX_BAKER` values with default fallback to `nvdiffrast`
 - `o-voxel/o_voxel/zyrex_uv_baker.py`
-  - UV triangle rasterization (`ZYREX_RASTER_IMPL=torch|triton`, defaults to Triton on CUDA when available; torch fallback otherwise)
+  - UV triangle rasterization (`ZYREX_RASTER_IMPL=torch|triton`, defaults to torch; Triton is explicit opt-in)
   - Barycentric interpolation (torch)
   - Sparse voxel trilinear sampling (torch `grid_sample`)
   - Seam dilation/padding (iterative neighbor fill)
@@ -59,7 +59,7 @@ Raster parity note:
   - the two winning faces must be adjacent (share an edge), and
   - the texel center must be on that shared edge within 8-bit fixed-point tolerance (`|edge_fn| <= 1` subpixel unit), or interpolated UV positions agree within `1e-4`.
 - Non-edge mismatches are treated as regressions.
-- Raster implementation can be forced with `ZYREX_RASTER_IMPL=torch|triton`; default is `triton` on CUDA when available, otherwise torch fallback.
+- Raster implementation can be forced with `ZYREX_RASTER_IMPL=torch|triton`; default is `torch` (Triton remains explicit opt-in).
 
 ---
 

@@ -2,6 +2,8 @@ import importlib.util
 import io
 import json
 import math
+import os
+import subprocess
 import struct
 import sys
 from pathlib import Path
@@ -390,6 +392,82 @@ def test_feature_flag_default_and_override(monkeypatch):
 
     monkeypatch.setenv("ZYREX_BAKER", "invalid-backend")
     assert resolve_baker_backend() == DEFAULT_BAKER_BACKEND
+
+
+def test_raster_impl_default_is_torch(monkeypatch):
+    monkeypatch.delenv("ZYREX_RASTER_IMPL", raising=False)
+    monkeypatch.delenv("TRITON_INTERPRET", raising=False)
+    assert _UV_MODULE._resolve_raster_impl(torch.device("cpu")) == "torch"
+    assert _UV_MODULE._resolve_raster_impl(torch.device("cuda")) == "torch"
+
+
+def test_uv_rasterization_triton_interpret_matches_torch_cpu():
+    pytest.importorskip("triton")
+    script = f"""
+import importlib.util
+import json
+import sys
+import torch
+
+uv_path = {str(_UV_PATH)!r}
+spec = importlib.util.spec_from_file_location("zyrex_uv_baker_interpret_test_impl", uv_path)
+if spec is None or spec.loader is None:
+    raise RuntimeError(f"Failed to load uv baker module from {{uv_path}}")
+mod = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = mod
+spec.loader.exec_module(mod)
+
+uvs = torch.tensor(
+    [
+        [0.03, 0.04],
+        [0.97, 0.06],
+        [0.95, 0.94],
+        [0.06, 0.96],
+        [0.15, 0.20],
+        [0.85, 0.18],
+        [0.55, 0.78],
+        [0.10, 0.86],
+        [0.91, 0.83],
+    ],
+    dtype=torch.float32,
+    device="cpu",
+)
+faces = torch.tensor(
+    [
+        [0, 1, 2],
+        [0, 2, 3],
+        [4, 5, 6],
+        [4, 6, 7],
+        [6, 5, 8],
+        [7, 8, 6],
+    ],
+    dtype=torch.long,
+    device="cpu",
+)
+tex = 256
+
+import os
+os.environ["ZYREX_RASTER_IMPL"] = "torch"
+raster_torch = mod.rasterize_uv_triangles(uvs, faces, tex)
+os.environ["ZYREX_RASTER_IMPL"] = "triton"
+raster_triton = mod.rasterize_uv_triangles(uvs, faces, tex)
+
+payload = {{
+    "mask_equal": bool(torch.equal(raster_torch.mask, raster_triton.mask)),
+    "face_equal": bool(torch.equal(
+        raster_torch.face_indices[raster_torch.mask],
+        raster_triton.face_indices[raster_triton.mask]
+    )),
+}}
+print(json.dumps(payload))
+"""
+    env = os.environ.copy()
+    env["TRITON_INTERPRET"] = "1"
+    proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, env=env)
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert payload["mask_equal"]
+    assert payload["face_equal"]
 
 
 def _analytic_attr(pos: torch.Tensor) -> dict[str, torch.Tensor]:
