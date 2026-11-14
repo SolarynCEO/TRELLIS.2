@@ -477,21 +477,34 @@ def test_bake_glb_maps_from_prepared_zyrex_matches_nvdiffrast_tiny(monkeypatch):
     except ImportError as exc:
         missing = exc.name or "flex_gemm.ops.grid_sample"
         pytest.skip(f"Missing module: {missing}")
+    if getattr(flex_grid_sample, "__spec__", None) is None:
+        pytest.fail(
+            "Detected stubbed flex_gemm.ops.grid_sample module (__spec__ is None). "
+            "test_low_vram_mode.py must scope its sys.modules stubs with monkeypatch."
+        )
     if not hasattr(flex_grid_sample, "grid_sample_3d"):
         pytest.skip("Missing symbol: flex_gemm.ops.grid_sample.grid_sample_3d")
 
     # postprocess imports cumesh at module import time; this test path does not
     # execute any cumesh calls, so provide a lightweight stub when unavailable.
-    cumesh_available = True
     try:
         importlib.import_module("cumesh")
     except ImportError:
-        cumesh_available = False
         import types
 
         monkeypatch.setitem(sys.modules, "cumesh", types.ModuleType("cumesh"))
 
     post_module = importlib.import_module("o_voxel.postprocess")
+    post_module = importlib.reload(post_module)
+    grid_sample_impl = getattr(post_module, "grid_sample_3d", None)
+    if grid_sample_impl is None:
+        pytest.fail("o_voxel.postprocess.grid_sample_3d is missing after import.")
+    impl_module = getattr(grid_sample_impl, "__module__", "")
+    if (not impl_module.startswith("flex_gemm.ops.grid_sample")) or ("test_low_vram_mode" in impl_module):
+        pytest.fail(
+            "Export-path parity test bound a stub grid_sample_3d "
+            f"(module={impl_module!r}); expected flex_gemm.ops.grid_sample."
+        )
 
     device = torch.device("cuda")
     grid_res = 32
@@ -499,86 +512,58 @@ def test_bake_glb_maps_from_prepared_zyrex_matches_nvdiffrast_tiny(monkeypatch):
     grid_size = torch.tensor([grid_res, grid_res, grid_res], dtype=torch.int32, device=device).contiguous()
     voxel_size = torch.tensor([1.0 / grid_res] * 3, dtype=torch.float32, device=device).contiguous()
 
-    prepared = None
-    if cumesh_available:
-        seed_vertices = torch.tensor(
-            [
-                [-0.45, -0.45, 0.0],
-                [0.45, -0.45, 0.0],
-                [0.45, 0.45, 0.0],
-                [-0.45, 0.45, 0.0],
-            ],
-            dtype=torch.float32,
-            device=device,
-        ).contiguous()
-        seed_faces = torch.tensor([[0, 1, 2], [0, 2, 3]], dtype=torch.int32, device=device).contiguous()
-        try:
-            prepared = post_module.prepare_glb_bake_inputs(
-                vertices=seed_vertices,
-                faces=seed_faces,
-                aabb=aabb,
-                grid_size=grid_size,
-                decimation_target=16,
-                remesh=False,
-                verbose=False,
-                collect_debug=True,
-            )
-        except Exception:
-            prepared = None
+    out_vertices = torch.tensor(
+        [[-0.45, -0.45, 0.0], [0.45, -0.45, 0.0], [-0.45, 0.45, 0.0]],
+        dtype=torch.float32,
+        device=device,
+    ).contiguous()
+    out_faces = torch.tensor([[0, 1, 2]], dtype=torch.int32, device=device).contiguous()
+    out_uvs = torch.tensor(
+        [[0.05, 0.05], [0.95, 0.05], [0.05, 0.95]],
+        dtype=torch.float32,
+        device=device,
+    ).contiguous()
+    out_normals = torch.tensor([[0.0, 0.0, 1.0]] * 3, dtype=torch.float32, device=device).contiguous()
+    source_vertices = out_vertices.clone().contiguous()
+    source_faces = out_faces.clone().contiguous()
 
-    if prepared is None:
-        out_vertices = torch.tensor(
-            [[-0.45, -0.45, 0.0], [0.45, -0.45, 0.0], [-0.45, 0.45, 0.0]],
-            dtype=torch.float32,
-            device=device,
-        ).contiguous()
-        out_faces = torch.tensor([[0, 1, 2]], dtype=torch.int32, device=device).contiguous()
-        out_uvs = torch.tensor(
-            [[0.05, 0.05], [0.95, 0.05], [0.05, 0.95]],
-            dtype=torch.float32,
-            device=device,
-        ).contiguous()
-        out_normals = torch.tensor([[0.0, 0.0, 1.0]] * 3, dtype=torch.float32, device=device).contiguous()
-        source_vertices = out_vertices.clone().contiguous()
-        source_faces = out_faces.clone().contiguous()
+    tri = source_vertices[source_faces[0].long()]
 
-        tri = source_vertices[source_faces[0].long()]
+    class _DummyBVH:
+        def __init__(self, tri_vertices: torch.Tensor):
+            self.tri = tri_vertices
 
-        class _DummyBVH:
-            def __init__(self, tri_vertices: torch.Tensor):
-                self.tri = tri_vertices
+        def unsigned_distance(self, query_positions: torch.Tensor, return_uvw: bool = True):
+            v0 = self.tri[0]
+            v1 = self.tri[1]
+            v2 = self.tri[2]
+            e1 = v1 - v0
+            e2 = v2 - v0
+            vp = query_positions - v0
+            d11 = torch.dot(e1, e1)
+            d12 = torch.dot(e1, e2)
+            d22 = torch.dot(e2, e2)
+            dp1 = torch.matmul(vp, e1)
+            dp2 = torch.matmul(vp, e2)
+            denom = d11 * d22 - d12 * d12
+            denom_safe = denom if float(abs(denom).item()) > 1e-20 else torch.tensor(1.0, dtype=vp.dtype, device=vp.device)
+            w1 = (dp1 * d22 - dp2 * d12) / denom_safe
+            w2 = (dp2 * d11 - dp1 * d12) / denom_safe
+            w0 = 1.0 - w1 - w2
+            uvw = torch.stack([w0, w1, w2], dim=-1).to(query_positions.dtype)
+            face_id = torch.zeros((query_positions.shape[0],), dtype=torch.int64, device=query_positions.device)
+            dist = torch.zeros((query_positions.shape[0],), dtype=query_positions.dtype, device=query_positions.device)
+            return dist, face_id, uvw
 
-            def unsigned_distance(self, query_positions: torch.Tensor, return_uvw: bool = True):
-                v0 = self.tri[0]
-                v1 = self.tri[1]
-                v2 = self.tri[2]
-                e1 = v1 - v0
-                e2 = v2 - v0
-                vp = query_positions - v0
-                d11 = torch.dot(e1, e1)
-                d12 = torch.dot(e1, e2)
-                d22 = torch.dot(e2, e2)
-                dp1 = torch.matmul(vp, e1)
-                dp2 = torch.matmul(vp, e2)
-                denom = d11 * d22 - d12 * d12
-                denom_safe = denom if float(abs(denom).item()) > 1e-20 else torch.tensor(1.0, dtype=vp.dtype, device=vp.device)
-                w1 = (dp1 * d22 - dp2 * d12) / denom_safe
-                w2 = (dp2 * d11 - dp1 * d12) / denom_safe
-                w0 = 1.0 - w1 - w2
-                uvw = torch.stack([w0, w1, w2], dim=-1).to(query_positions.dtype)
-                face_id = torch.zeros((query_positions.shape[0],), dtype=torch.int64, device=query_positions.device)
-                dist = torch.zeros((query_positions.shape[0],), dtype=query_positions.dtype, device=query_positions.device)
-                return dist, face_id, uvw
-
-        prepared = {
-            "out_vertices": out_vertices,
-            "out_faces": out_faces,
-            "out_uvs": out_uvs,
-            "out_normals": out_normals,
-            "source_vertices": source_vertices,
-            "source_faces": source_faces,
-            "bvh": _DummyBVH(tri),
-        }
+    prepared = {
+        "out_vertices": out_vertices,
+        "out_faces": out_faces,
+        "out_uvs": out_uvs,
+        "out_normals": out_normals,
+        "source_vertices": source_vertices,
+        "source_faces": source_faces,
+        "bvh": _DummyBVH(tri),
+    }
 
     gx, gy, gz = torch.meshgrid(
         torch.arange(grid_res, dtype=torch.int32, device=device),
