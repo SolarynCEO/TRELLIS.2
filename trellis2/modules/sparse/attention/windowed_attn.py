@@ -2,6 +2,7 @@ from typing import *
 import torch
 import math
 import torch.nn.functional as F
+import warnings
 from .. import SparseTensor
 from .. import config
 
@@ -63,6 +64,15 @@ def _windowed_cross_attention_fallback(
     return torch.cat(out_chunks, dim=0)
 
 
+def _fallback_sparse_backend_to_sdpa(unavailable_backend: str, import_error: Exception) -> None:
+    warnings.warn(
+        f"[SPARSE_ATTENTION] Backend '{unavailable_backend}' is unavailable ({import_error}). Falling back to 'sdpa'.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    config.set_attn_backend('sdpa')
+
+
 def calc_window_partition(
     tensor: SparseTensor,
     window_size: Union[int, Tuple[int, ...]],
@@ -104,7 +114,11 @@ def calc_window_partition(
     
     if config.ATTN == 'xformers':
         if 'xops' not in globals():
-            import xformers.ops as xops
+            try:
+                import xformers.ops as xops
+            except Exception as e:
+                _fallback_sparse_backend_to_sdpa('xformers', e)
+                return fwd_indices, bwd_indices, seq_lens, attn_func_args
         attn_func_args = {
             'attn_bias': xops.fmha.BlockDiagonalMask.from_seqlens(seq_lens)
         }
@@ -156,7 +170,13 @@ def sparse_windowed_scaled_dot_product_self_attention(
 
     if config.ATTN == 'xformers':
         if 'xops' not in globals():
-            import xformers.ops as xops
+            try:
+                import xformers.ops as xops
+            except Exception as e:
+                _fallback_sparse_backend_to_sdpa('xformers', e)
+                out = _windowed_self_attention_fallback(qkv_feats, seq_lens, 'sdpa')
+                out = out[bwd_indices]
+                return qkv.replace(out)
         q, k, v = qkv_feats.unbind(dim=1)                                               # [M, H, C]
         q = q.unsqueeze(0)                                                              # [1, M, H, C]
         k = k.unsqueeze(0)                                                              # [1, M, H, C]
@@ -164,7 +184,13 @@ def sparse_windowed_scaled_dot_product_self_attention(
         out = xops.memory_efficient_attention(q, k, v, **attn_func_args)[0]             # [M, H, C]
     elif config.ATTN == 'flash_attn':
         if 'flash_attn' not in globals():
-            import flash_attn
+            try:
+                import flash_attn
+            except Exception as e:
+                _fallback_sparse_backend_to_sdpa('flash_attn', e)
+                out = _windowed_self_attention_fallback(qkv_feats, seq_lens, 'sdpa')
+                out = out[bwd_indices]
+                return qkv.replace(out)
         out = flash_attn.flash_attn_varlen_qkvpacked_func(qkv_feats, **attn_func_args)  # [M, H, C]
     elif config.ATTN in ['sdpa', 'naive']:
         out = _windowed_self_attention_fallback(qkv_feats, seq_lens, config.ATTN)        # [M, H, C]
@@ -227,7 +253,13 @@ def sparse_windowed_scaled_dot_product_cross_attention(
 
     if config.ATTN == 'xformers':
         if 'xops' not in globals():
-            import xformers.ops as xops
+            try:
+                import xformers.ops as xops
+            except Exception as e:
+                _fallback_sparse_backend_to_sdpa('xformers', e)
+                out = _windowed_cross_attention_fallback(q_feats, kv_feats, q_seq_lens, kv_seq_lens, 'sdpa')
+                out = out[q_bwd_indices]
+                return q.replace(out)
         k, v = kv_feats.unbind(dim=1)                                                   # [M, H, C]
         q = q_feats.unsqueeze(0)                                                        # [1, M, H, C]
         k = k.unsqueeze(0)                                                              # [1, M, H, C]
@@ -236,7 +268,13 @@ def sparse_windowed_scaled_dot_product_cross_attention(
         out = xops.memory_efficient_attention(q, k, v, attn_bias=mask)[0]               # [M, H, C]
     elif config.ATTN == 'flash_attn':
         if 'flash_attn' not in globals():
-            import flash_attn
+            try:
+                import flash_attn
+            except Exception as e:
+                _fallback_sparse_backend_to_sdpa('flash_attn', e)
+                out = _windowed_cross_attention_fallback(q_feats, kv_feats, q_seq_lens, kv_seq_lens, 'sdpa')
+                out = out[q_bwd_indices]
+                return q.replace(out)
         out = flash_attn.flash_attn_varlen_kvpacked_func(q_feats, kv_feats,
             cu_seqlens_q=q_attn_func_args['cu_seqlens'], cu_seqlens_k=kv_attn_func_args['cu_seqlens'],
             max_seqlen_q=q_attn_func_args['max_seqlen'], max_seqlen_k=kv_attn_func_args['max_seqlen'],

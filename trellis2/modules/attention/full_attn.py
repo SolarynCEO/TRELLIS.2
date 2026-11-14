@@ -1,6 +1,7 @@
 from typing import *
 import torch
 import math
+import warnings
 from . import config
 
 
@@ -22,6 +23,15 @@ def _naive_sdpa(q, k, v):
     out = attn_weight @ v
     out = out.permute(0, 2, 1, 3)   # [N, L, H, C]
     return out
+
+
+def _fallback_backend_to_sdpa(unavailable_backend: str, import_error: Exception) -> None:
+    warnings.warn(
+        f"[ATTENTION] Backend '{unavailable_backend}' is unavailable ({import_error}). Falling back to 'sdpa'.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    config.set_backend('sdpa')
 
 
 @overload
@@ -96,7 +106,11 @@ def scaled_dot_product_attention(*args, **kwargs):
 
     if config.BACKEND == 'xformers':
         if 'xops' not in globals():
-            import xformers.ops as xops
+            try:
+                import xformers.ops as xops
+            except Exception as e:
+                _fallback_backend_to_sdpa('xformers', e)
+                return scaled_dot_product_attention(*args, **kwargs)
         if num_all_args == 1:
             q, k, v = qkv.unbind(dim=2)
         elif num_all_args == 2:
@@ -104,7 +118,11 @@ def scaled_dot_product_attention(*args, **kwargs):
         out = xops.memory_efficient_attention(q, k, v)
     elif config.BACKEND == 'flash_attn':
         if 'flash_attn' not in globals():
-            import flash_attn
+            try:
+                import flash_attn
+            except Exception as e:
+                _fallback_backend_to_sdpa('flash_attn', e)
+                return scaled_dot_product_attention(*args, **kwargs)
         if num_all_args == 1:
             out = flash_attn.flash_attn_qkvpacked_func(qkv)
         elif num_all_args == 2:
@@ -113,14 +131,18 @@ def scaled_dot_product_attention(*args, **kwargs):
             out = flash_attn.flash_attn_func(q, k, v)
     elif config.BACKEND == 'flash_attn_3':
         if 'flash_attn_3' not in globals():
-            import flash_attn_interface as flash_attn_3
-            if num_all_args == 1:
-                out = flash_attn_3.flash_attn_qkvpacked_func(qkv)
-            elif num_all_args == 2:
-                k, v = kv.unbind(dim=2)
-                out = flash_attn_3.flash_attn_func(q, k, v)
-            elif num_all_args == 3:
-                out = flash_attn_3.flash_attn_func(q, k, v)
+            try:
+                import flash_attn_interface as flash_attn_3
+            except Exception as e:
+                _fallback_backend_to_sdpa('flash_attn_3', e)
+                return scaled_dot_product_attention(*args, **kwargs)
+        if num_all_args == 1:
+            out = flash_attn_3.flash_attn_qkvpacked_func(qkv)
+        elif num_all_args == 2:
+            k, v = kv.unbind(dim=2)
+            out = flash_attn_3.flash_attn_func(q, k, v)
+        elif num_all_args == 3:
+            out = flash_attn_3.flash_attn_func(q, k, v)
     elif config.BACKEND == 'sdpa':
         if 'sdpa' not in globals():
             from torch.nn.functional import scaled_dot_product_attention as sdpa

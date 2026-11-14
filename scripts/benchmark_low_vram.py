@@ -1,8 +1,9 @@
 import argparse
 import json
 import os
+import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from PIL import Image
@@ -46,9 +47,18 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    repo_root = Path(__file__).resolve().parent.parent
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    vram_profile = None if args.vram_profile == "none" else args.vram_profile
+    if vram_profile == "8gb":
+        os.environ.setdefault("ATTN_BACKEND", "sdpa")
+        os.environ.setdefault("SPARSE_ATTN_BACKEND", "sdpa")
     if args.attention_backend is not None:
         os.environ["ATTN_BACKEND"] = args.attention_backend
+        os.environ["SPARSE_ATTN_BACKEND"] = args.attention_backend
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this benchmark.")
@@ -64,7 +74,6 @@ def main() -> None:
     pipeline = Trellis2ImageTo3DPipeline.from_pretrained(args.model_id)
     pipeline.to(torch.device("cuda"))
 
-    vram_profile = None if args.vram_profile == "none" else args.vram_profile
     wall_start = time.perf_counter()
     outputs, run_metrics = pipeline.run(
         image=image,
@@ -92,7 +101,7 @@ def main() -> None:
         remesh_project=0,
         use_tqdm=True,
     )
-    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     glb_path = output_dir / f"low_vram_benchmark_{ts}.glb"
     glb.export(str(glb_path), extension_webp=True)
     wall_total = time.perf_counter() - wall_start

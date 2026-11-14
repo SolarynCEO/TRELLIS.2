@@ -27,6 +27,9 @@ When `vram_profile="8gb"` is active, the pipeline:
 5. **Supports optional autocast precision in low-VRAM mode**:
    - default: `fp16`
    - override via `ZYREX_LOW_VRAM_DTYPE=bf16|fp16|none`
+6. **Sets SDPA attention backend by default in low-VRAM mode**:
+   - when `ZYREX_LOW_VRAM=1`, this fork defaults `ATTN_BACKEND=sdpa` and `SPARSE_ATTN_BACKEND=sdpa` unless already set
+   - if flash-attn/xformers are unavailable, runtime attention calls automatically fall back to SDPA
 
 ## Default behavior compatibility
 
@@ -75,6 +78,33 @@ What it outputs:
   - settings used
   - output GLB path
 
+## One measured target-hardware run (user-provided)
+
+Hardware:
+
+- RTX 4070 Laptop GPU (8 GB VRAM), Windows, CUDA 12.4
+- torch 2.6.0+cu124
+
+Run settings:
+
+- seed: `42`
+- input: warlord image
+- profile: `8gb`
+- pipeline: `512`
+- token cap: `32768`
+- precision: `fp16`
+- attention backend: `sdpa`
+
+Observed metrics from that run:
+
+- total wall time: **87.9 s**
+- generation time: **72.0 s**
+- peak allocated VRAM: **3.35 GB**
+- peak reserved VRAM: **4.59 GB**
+- output GLB: **498k faces**, **2048 texture**, visual result reported as correct
+
+This is a single run datapoint; expect variance by image complexity, seed, and backend/runtime state.
+
 ### PowerShell example (recommended for laptop validation)
 
 ```powershell
@@ -99,6 +129,16 @@ set ATTN_BACKEND=sdpa
 set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 py -3 scripts\benchmark_low_vram.py --image "assets\example_image\T.png" --vram-profile 8gb --pipeline-type 512 --max-num-tokens 32768 --output-dir "outputs\benchmarks"
 ```
+
+## Dependency notes for Windows/BiRefNet
+
+- Use `transformers>=4.56,<5` (validated with `4.57.6`)
+- BiRefNet remote code requires:
+  - `einops`
+  - `kornia`
+  - `timm`
+
+These are included in `requirements.txt` and `setup.sh --basic`.
 
 ## Important measurement note
 

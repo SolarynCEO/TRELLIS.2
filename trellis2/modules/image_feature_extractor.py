@@ -88,15 +88,37 @@ class DinoV3FeatureExtractor:
 
     def extract_features(self, image: torch.Tensor) -> torch.Tensor:
         image = image.to(self.model.embeddings.patch_embeddings.weight.dtype)
-        hidden_states = self.model.embeddings(image, bool_masked_pos=None)
-        position_embeddings = self.model.rope_embeddings(image)
-
-        for i, layer_module in enumerate(self.model.layer):
-            hidden_states = layer_module(
-                hidden_states,
-                position_embeddings=position_embeddings,
-            )
-
+        try:
+            hidden_states = self.model.embeddings(image, bool_masked_pos=None)
+            position_embeddings = self.model.rope_embeddings(image) if hasattr(self.model, "rope_embeddings") else None
+            layer_stack = None
+            for candidate in (
+                getattr(self.model, "layer", None),
+                getattr(getattr(self.model, "encoder", None), "layer", None),
+                getattr(getattr(self.model, "encoder", None), "layers", None),
+                getattr(self.model, "layers", None),
+            ):
+                if candidate is not None:
+                    layer_stack = candidate
+                    break
+            if layer_stack is None:
+                raise AttributeError("No compatible transformer block stack found on DINOv3 model.")
+            for layer_module in layer_stack:
+                if position_embeddings is None:
+                    hidden_states = layer_module(hidden_states)
+                else:
+                    hidden_states = layer_module(
+                        hidden_states,
+                        position_embeddings=position_embeddings,
+                    )
+        except Exception:
+            outputs = self.model(pixel_values=image)
+            if hasattr(outputs, "last_hidden_state"):
+                hidden_states = outputs.last_hidden_state
+            elif isinstance(outputs, (tuple, list)) and len(outputs) > 0:
+                hidden_states = outputs[0]
+            else:
+                raise RuntimeError("Unable to extract hidden states from DINOv3 model output.")
         return F.layer_norm(hidden_states, hidden_states.shape[-1:])
         
     @torch.no_grad()

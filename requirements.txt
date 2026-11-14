@@ -1,0 +1,16 @@
+imageio
+imageio-ffmpeg
+tqdm
+easydict
+opencv-python-headless
+ninja
+trimesh
+transformers>=4.56,<5
+gradio==6.0.1
+tensorboard
+pandas
+lpips
+zstandard
+einops
+kornia
+timm

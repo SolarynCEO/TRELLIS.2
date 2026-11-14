@@ -2,6 +2,7 @@ from typing import *
 import torch
 import torch.nn.functional as F
 import math
+import warnings
 from .. import VarLenTensor
 from .. import config
 
@@ -36,6 +37,15 @@ def _varlen_attention_fallback(
         q_start += q_len
         kv_start += kv_len
     return torch.cat(out_chunks, dim=0)
+
+
+def _fallback_sparse_backend_to_sdpa(unavailable_backend: str, import_error: Exception) -> None:
+    warnings.warn(
+        f"[SPARSE_ATTENTION] Backend '{unavailable_backend}' is unavailable ({import_error}). Falling back to 'sdpa'.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    config.set_attn_backend('sdpa')
 
 
 @overload
@@ -200,7 +210,11 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
 
     if config.ATTN == 'xformers':
         if 'xops' not in globals():
-            import xformers.ops as xops
+            try:
+                import xformers.ops as xops
+            except Exception as e:
+                _fallback_sparse_backend_to_sdpa('xformers', e)
+                return sparse_scaled_dot_product_attention(*args, **kwargs)
         if num_all_args == 1:
             q, k, v = qkv.unbind(dim=1)
         elif num_all_args == 2:
@@ -212,7 +226,11 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
         out = xops.memory_efficient_attention(q, k, v, mask)[0]
     elif config.ATTN == 'flash_attn':
         if 'flash_attn' not in globals():
-            import flash_attn
+            try:
+                import flash_attn
+            except Exception as e:
+                _fallback_sparse_backend_to_sdpa('flash_attn', e)
+                return sparse_scaled_dot_product_attention(*args, **kwargs)
         cu_seqlens_q = torch.cat([torch.tensor([0]), torch.cumsum(torch.tensor(q_seqlen), dim=0)]).int().to(device)
         if num_all_args in [2, 3]:
             cu_seqlens_kv = torch.cat([torch.tensor([0]), torch.cumsum(torch.tensor(kv_seqlen), dim=0)]).int().to(device)
@@ -224,7 +242,11 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
             out = flash_attn.flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max(q_seqlen), max(kv_seqlen))
     elif config.ATTN == 'flash_attn_3':
         if 'flash_attn_3' not in globals():
-            import flash_attn_interface as flash_attn_3
+            try:
+                import flash_attn_interface as flash_attn_3
+            except Exception as e:
+                _fallback_sparse_backend_to_sdpa('flash_attn_3', e)
+                return sparse_scaled_dot_product_attention(*args, **kwargs)
         cu_seqlens_q = torch.cat([torch.tensor([0]), torch.cumsum(torch.tensor(q_seqlen), dim=0)]).int().to(device)
         if num_all_args == 1:
             q, k, v = qkv.unbind(dim=1)

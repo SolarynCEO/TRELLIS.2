@@ -187,13 +187,18 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         preferred_backend = profile_cfg.get('prefer_attention_backend')
         if preferred_backend is None:
             return
-        if os.environ.get('ATTN_BACKEND') or os.environ.get('SPARSE_ATTN_BACKEND'):
-            return
         from ..modules.attention import config as dense_attn_config
         from ..modules.sparse import config as sparse_config
-        dense_attn_config.BACKEND = preferred_backend
-        sparse_config.ATTN = preferred_backend
-        print(f"[LOW_VRAM] forcing ATTN_BACKEND={preferred_backend} for profile compatibility")
+        if os.environ.get('ATTN_BACKEND') is None:
+            os.environ['ATTN_BACKEND'] = preferred_backend
+        if os.environ.get('SPARSE_ATTN_BACKEND') is None:
+            os.environ['SPARSE_ATTN_BACKEND'] = preferred_backend
+        dense_attn_config.set_backend(os.environ.get('ATTN_BACKEND', preferred_backend))
+        sparse_config.set_attn_backend(os.environ.get('SPARSE_ATTN_BACKEND', preferred_backend))
+        print(
+            "[LOW_VRAM] active attention backends: "
+            f"dense={dense_attn_config.BACKEND}, sparse={sparse_config.ATTN}"
+        )
 
     def _run_stage(
         self,
