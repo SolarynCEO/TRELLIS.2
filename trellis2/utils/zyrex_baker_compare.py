@@ -706,25 +706,47 @@ def run_gpu_comparison_real_asset(
     mr_t = torch.from_numpy(mr).cuda()
     normal_t = torch.from_numpy(normal).cuda()
 
-    _progress("gpu_real_asset: nvdiffrast bake start", started)
-    torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats()
-    t0 = time.perf_counter()
-    nvd = _bake_texture_maps_nvdiffrast(uvs, faces, base_t, mr_t, normal_t, texture_size)
-    torch.cuda.synchronize()
-    nvd_time = time.perf_counter() - t0
-    nvd_alloc_mb = torch.cuda.max_memory_allocated() / (1024**2)
-    nvd_reserved_mb = torch.cuda.max_memory_reserved() / (1024**2)
+    def _run_real_backend(backend: str) -> Dict[str, object]:
+        if backend == "nvdiffrast":
+            bake_fn = lambda: _bake_texture_maps_nvdiffrast(uvs, faces, base_t, mr_t, normal_t, texture_size)
+        else:
+            bake_fn = lambda: _bake_texture_maps_zyrex(uvs, faces, base_t, mr_t, normal_t, texture_size)
 
-    _progress("gpu_real_asset: zyrex bake start", started)
-    torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats()
-    t1 = time.perf_counter()
-    zyx = _bake_texture_maps_zyrex(uvs, faces, base_t, mr_t, normal_t, texture_size)
-    torch.cuda.synchronize()
-    zyx_time = time.perf_counter() - t1
-    zyx_alloc_mb = torch.cuda.max_memory_allocated() / (1024**2)
-    zyx_reserved_mb = torch.cuda.max_memory_reserved() / (1024**2)
+        _progress(f"gpu_real_asset: {backend} warmup", started)
+        torch.cuda.synchronize()
+        _ = bake_fn()
+        torch.cuda.synchronize()
+
+        times: list[float] = []
+        allocs: list[float] = []
+        reserveds: list[float] = []
+        bakes = []
+        for run_idx in range(3):
+            _progress(f"gpu_real_asset: {backend} measured run {run_idx + 1}/3", started)
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            t0 = time.perf_counter()
+            baked = bake_fn()
+            torch.cuda.synchronize()
+            times.append(time.perf_counter() - t0)
+            allocs.append(float(torch.cuda.max_memory_allocated() / (1024**2)))
+            reserveds.append(float(torch.cuda.max_memory_reserved() / (1024**2)))
+            bakes.append(baked)
+        median_idx = int(np.argsort(np.array(times))[1])
+        return {
+            "bake": bakes[median_idx],
+            "times": times,
+            "allocs": allocs,
+            "reserveds": reserveds,
+            "median_time": float(np.median(np.array(times))),
+            "median_alloc": float(np.median(np.array(allocs))),
+            "median_reserved": float(np.median(np.array(reserveds))),
+        }
+
+    nvd_runs = _run_real_backend("nvdiffrast")
+    zyx_runs = _run_real_backend("zyrex")
+    nvd = nvd_runs["bake"]
+    zyx = zyx_runs["bake"]
     _progress("gpu_real_asset: both bakes complete", started)
 
     nvd_mask = nvd["mask"].detach().cpu().numpy().astype(bool)
@@ -767,14 +789,20 @@ def run_gpu_comparison_real_asset(
         "status": "measured",
         "texture_size": texture_size,
         "timing_seconds": {
-            "nvdiffrast": nvd_time,
-            "zyrex": zyx_time,
+            "nvdiffrast_median": nvd_runs["median_time"],
+            "zyrex_median": zyx_runs["median_time"],
+            "nvdiffrast_runs": nvd_runs["times"],
+            "zyrex_runs": zyx_runs["times"],
         },
         "peak_vram_mb": {
-            "nvdiffrast_allocated": nvd_alloc_mb,
-            "nvdiffrast_reserved": nvd_reserved_mb,
-            "zyrex_allocated": zyx_alloc_mb,
-            "zyrex_reserved": zyx_reserved_mb,
+            "nvdiffrast_allocated_median": nvd_runs["median_alloc"],
+            "nvdiffrast_reserved_median": nvd_runs["median_reserved"],
+            "zyrex_allocated_median": zyx_runs["median_alloc"],
+            "zyrex_reserved_median": zyx_runs["median_reserved"],
+            "nvdiffrast_allocated_runs": nvd_runs["allocs"],
+            "nvdiffrast_reserved_runs": nvd_runs["reserveds"],
+            "zyrex_allocated_runs": zyx_runs["allocs"],
+            "zyrex_reserved_runs": zyx_runs["reserveds"],
         },
         "seam_coverage": {
             "nvdiffrast_ratio": float(nvd_mask.mean()),
@@ -856,45 +884,56 @@ def run_gpu_comparison_voxel_input(
     prep_time = time.perf_counter() - prep_t0
     _progress("gpu_voxel: shared mesh+UV preparation done", started)
 
-    _progress("gpu_voxel: nvdiffrast bake-only start", started)
-    torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats()
-    t0 = time.perf_counter()
-    nvd_dbg = o_voxel.postprocess.bake_glb_maps_from_prepared(
-        prepared=prep,
-        attr_volume=attr_volume,
-        coords=coords,
-        attr_layout=attr_layout,
-        aabb=aabb,
-        voxel_size=voxel_size,
-        grid_size=grid_size,
-        texture_size=texture_size,
-        backend="nvdiffrast",
-    )
-    torch.cuda.synchronize()
-    nvd_time = time.perf_counter() - t0
-    nvd_alloc_mb = torch.cuda.max_memory_allocated() / (1024**2)
-    nvd_reserved_mb = torch.cuda.max_memory_reserved() / (1024**2)
+    def _run_voxel_backend(backend: str) -> Dict[str, object]:
+        def bake_once() -> Dict[str, object]:
+            return o_voxel.postprocess.bake_glb_maps_from_prepared(
+                prepared=prep,
+                attr_volume=attr_volume,
+                coords=coords,
+                attr_layout=attr_layout,
+                aabb=aabb,
+                voxel_size=voxel_size,
+                grid_size=grid_size,
+                texture_size=texture_size,
+                backend=backend,
+            )
 
-    _progress("gpu_voxel: zyrex bake-only start", started)
-    torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats()
-    t1 = time.perf_counter()
-    zyx_dbg = o_voxel.postprocess.bake_glb_maps_from_prepared(
-        prepared=prep,
-        attr_volume=attr_volume,
-        coords=coords,
-        attr_layout=attr_layout,
-        aabb=aabb,
-        voxel_size=voxel_size,
-        grid_size=grid_size,
-        texture_size=texture_size,
-        backend="zyrex",
-    )
-    torch.cuda.synchronize()
-    zyx_time = time.perf_counter() - t1
-    zyx_alloc_mb = torch.cuda.max_memory_allocated() / (1024**2)
-    zyx_reserved_mb = torch.cuda.max_memory_reserved() / (1024**2)
+        _progress(f"gpu_voxel: {backend} warmup", started)
+        torch.cuda.synchronize()
+        _ = bake_once()
+        torch.cuda.synchronize()
+
+        times: list[float] = []
+        allocs: list[float] = []
+        reserveds: list[float] = []
+        bakes = []
+        for run_idx in range(3):
+            _progress(f"gpu_voxel: {backend} measured run {run_idx + 1}/3", started)
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            t0 = time.perf_counter()
+            baked = bake_once()
+            torch.cuda.synchronize()
+            times.append(time.perf_counter() - t0)
+            allocs.append(float(torch.cuda.max_memory_allocated() / (1024**2)))
+            reserveds.append(float(torch.cuda.max_memory_reserved() / (1024**2)))
+            bakes.append(baked)
+
+        median_idx = int(np.argsort(np.array(times))[1])
+        return {
+            "debug": bakes[median_idx],
+            "times": times,
+            "allocs": allocs,
+            "reserveds": reserveds,
+            "median_time": float(np.median(np.array(times))),
+            "median_alloc": float(np.median(np.array(allocs))),
+            "median_reserved": float(np.median(np.array(reserveds))),
+        }
+
+    nvd_runs = _run_voxel_backend("nvdiffrast")
+    zyx_runs = _run_voxel_backend("zyrex")
+    nvd_dbg = nvd_runs["debug"]
+    zyx_dbg = zyx_runs["debug"]
     _progress("gpu_voxel: bake-only runs complete", started)
 
     nvd_hashes = dict(nvd_dbg.get("hashes", {}))
@@ -1031,14 +1070,20 @@ def run_gpu_comparison_voxel_input(
         "voxel_input_path": str(voxel_input_path.resolve()),
         "timing_seconds": {
             "shared_prepare_once": prep_time,
-            "nvdiffrast_bake_only": nvd_time,
-            "zyrex_bake_only": zyx_time,
+            "nvdiffrast_bake_only_median": nvd_runs["median_time"],
+            "zyrex_bake_only_median": zyx_runs["median_time"],
+            "nvdiffrast_bake_only_runs": nvd_runs["times"],
+            "zyrex_bake_only_runs": zyx_runs["times"],
         },
         "peak_vram_mb": {
-            "nvdiffrast_bake_only_allocated": nvd_alloc_mb,
-            "nvdiffrast_bake_only_reserved": nvd_reserved_mb,
-            "zyrex_bake_only_allocated": zyx_alloc_mb,
-            "zyrex_bake_only_reserved": zyx_reserved_mb,
+            "nvdiffrast_bake_only_allocated_median": nvd_runs["median_alloc"],
+            "nvdiffrast_bake_only_reserved_median": nvd_runs["median_reserved"],
+            "zyrex_bake_only_allocated_median": zyx_runs["median_alloc"],
+            "zyrex_bake_only_reserved_median": zyx_runs["median_reserved"],
+            "nvdiffrast_bake_only_allocated_runs": nvd_runs["allocs"],
+            "nvdiffrast_bake_only_reserved_runs": nvd_runs["reserveds"],
+            "zyrex_bake_only_allocated_runs": zyx_runs["allocs"],
+            "zyrex_bake_only_reserved_runs": zyx_runs["reserveds"],
         },
         "shared_prepared_hashes": nvd_hashes,
         "seam_coverage": {

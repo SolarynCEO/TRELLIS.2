@@ -47,6 +47,9 @@ def rasterize_uv_triangles(
         max_candidates_per_chunk = 1_500_000 if _is_truthy(os.environ.get("ZYREX_LOW_VRAM")) else 4_000_000
     face_chunk_size = max(int(face_chunk_size), 1)
     max_candidates_per_chunk = max(int(max_candidates_per_chunk), 1)
+    subpixel_bits = 8
+    subpixel_scale = 1 << subpixel_bits
+    area_eps = max(1, int(round(eps * (subpixel_scale**2))))
 
     faces_long = faces.long()
     uvs_px = uvs[:, :2].to(dtype=torch.float32).clone()
@@ -55,6 +58,7 @@ def rasterize_uv_triangles(
     uvs_px[:, 0] = uvs_px[:, 0] * width - 0.5
     uvs_px[:, 1] = uvs_px[:, 1] * height - 0.5
     tris = uvs_px[faces_long]  # [F, 3, 2]
+    tris_fp = torch.round(tris * subpixel_scale).to(torch.int64)
 
     num_pixels = height * width
     best_face = torch.full((num_pixels,), -1, dtype=torch.long, device=device)
@@ -65,11 +69,11 @@ def rasterize_uv_triangles(
     while start < total_faces:
         tentative_end = min(start + face_chunk_size, total_faces)
         while True:
-            tri_chunk = tris[start:tentative_end]
-            min_x = torch.floor(torch.min(tri_chunk[..., 0], dim=1).values).long().clamp(0, width - 1)
-            max_x = torch.ceil(torch.max(tri_chunk[..., 0], dim=1).values).long().clamp(0, width - 1)
-            min_y = torch.floor(torch.min(tri_chunk[..., 1], dim=1).values).long().clamp(0, height - 1)
-            max_y = torch.ceil(torch.max(tri_chunk[..., 1], dim=1).values).long().clamp(0, height - 1)
+            tri_chunk_fp = tris_fp[start:tentative_end]
+            min_x = torch.ceil(torch.min(tri_chunk_fp[..., 0], dim=1).values.to(torch.float32) / subpixel_scale).long().clamp(0, width - 1)
+            max_x = torch.floor(torch.max(tri_chunk_fp[..., 0], dim=1).values.to(torch.float32) / subpixel_scale).long().clamp(0, width - 1)
+            min_y = torch.ceil(torch.min(tri_chunk_fp[..., 1], dim=1).values.to(torch.float32) / subpixel_scale).long().clamp(0, height - 1)
+            max_y = torch.floor(torch.max(tri_chunk_fp[..., 1], dim=1).values.to(torch.float32) / subpixel_scale).long().clamp(0, height - 1)
             widths = max_x - min_x + 1
             heights = max_y - min_y + 1
             valid_bbox = (widths > 0) & (heights > 0)
@@ -81,11 +85,11 @@ def rasterize_uv_triangles(
                 break
             tentative_end = start + max(1, (tentative_end - start) // 2)
 
-        tri_chunk = tris[start:tentative_end]
-        min_x = torch.floor(torch.min(tri_chunk[..., 0], dim=1).values).long().clamp(0, width - 1)
-        max_x = torch.ceil(torch.max(tri_chunk[..., 0], dim=1).values).long().clamp(0, width - 1)
-        min_y = torch.floor(torch.min(tri_chunk[..., 1], dim=1).values).long().clamp(0, height - 1)
-        max_y = torch.ceil(torch.max(tri_chunk[..., 1], dim=1).values).long().clamp(0, height - 1)
+        tri_chunk_fp = tris_fp[start:tentative_end]
+        min_x = torch.ceil(torch.min(tri_chunk_fp[..., 0], dim=1).values.to(torch.float32) / subpixel_scale).long().clamp(0, width - 1)
+        max_x = torch.floor(torch.max(tri_chunk_fp[..., 0], dim=1).values.to(torch.float32) / subpixel_scale).long().clamp(0, width - 1)
+        min_y = torch.ceil(torch.min(tri_chunk_fp[..., 1], dim=1).values.to(torch.float32) / subpixel_scale).long().clamp(0, height - 1)
+        max_y = torch.floor(torch.max(tri_chunk_fp[..., 1], dim=1).values.to(torch.float32) / subpixel_scale).long().clamp(0, height - 1)
         widths = max_x - min_x + 1
         heights = max_y - min_y + 1
         valid_bbox = (widths > 0) & (heights > 0)
@@ -94,7 +98,7 @@ def rasterize_uv_triangles(
             continue
 
         local_face_ids = torch.nonzero(valid_bbox, as_tuple=False).squeeze(1)
-        tri_valid = tri_chunk[local_face_ids]
+        tri_valid_fp = tri_chunk_fp[local_face_ids]
         min_x_v = min_x[local_face_ids]
         min_y_v = min_y[local_face_ids]
         widths_v = widths[local_face_ids]
@@ -118,10 +122,10 @@ def rasterize_uv_triangles(
         min_y_rep = torch.repeat_interleave(min_y_v, areas_v)
         x_int = min_x_rep + x_local
         y_int = min_y_rep + y_local
-        x = x_int.to(torch.float32)
-        y = y_int.to(torch.float32)
+        x = x_int.to(torch.int64) * subpixel_scale
+        y = y_int.to(torch.int64) * subpixel_scale
 
-        tri = tri_valid[compact_rep]
+        tri = tri_valid_fp[compact_rep]
         v0 = tri[:, 0]
         v1 = tri[:, 1]
         v2 = tri[:, 2]
@@ -133,7 +137,7 @@ def rasterize_uv_triangles(
             v1 = v1_swapped
             v2 = v2_swapped
             area = torch.abs(area)
-        nondegenerate = area >= eps
+        nondegenerate = area >= area_eps
         safe_area = torch.where(nondegenerate, area, torch.ones_like(area))
 
         # Edge functions for top-left rule.
@@ -153,9 +157,9 @@ def rasterize_uv_triangles(
 
         inside = (
             nondegenerate
-            & ((e0 < 0) | ((torch.abs(e0) <= eps) & tl0))
-            & ((e1 < 0) | ((torch.abs(e1) <= eps) & tl1))
-            & ((e2 < 0) | ((torch.abs(e2) <= eps) & tl2))
+            & ((e0 < 0) | ((e0 == 0) & tl0))
+            & ((e1 < 0) | ((e1 == 0) & tl1))
+            & ((e2 < 0) | ((e2 == 0) & tl2))
         )
         if not inside.any():
             start = tentative_end
@@ -164,9 +168,10 @@ def rasterize_uv_triangles(
         compact_rep = compact_rep[inside]
         pix_idx = y_int[inside] * width + x_int[inside]
         face_idx = (start + local_face_ids[compact_rep]).long()
-        w0 = -e0 / safe_area
-        w1 = -e1 / safe_area
-        w2 = -e2 / safe_area
+        safe_area_f = safe_area.to(torch.float32)
+        w0 = -e0.to(torch.float32) / safe_area_f
+        w1 = -e1.to(torch.float32) / safe_area_f
+        w2 = -e2.to(torch.float32) / safe_area_f
         bary = torch.stack([w0[inside], w1[inside], w2[inside]], dim=-1).to(dtype=dtype)
         # If triangle winding was swapped for coverage tests, remap bary weights
         # back to original face vertex order (v0, v1_orig, v2_orig).
