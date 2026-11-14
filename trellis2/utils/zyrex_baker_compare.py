@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import math
 import platform
@@ -8,23 +9,26 @@ import resource
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
 import numpy as np
 import torch
 
 ROOT = Path(__file__).resolve().parents[2]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+_ZYREX_UV_BAKER_PATH = ROOT / "o-voxel" / "o_voxel" / "zyrex_uv_baker.py"
+_ZYREX_SPEC = importlib.util.spec_from_file_location("zyrex_uv_baker_compare_impl", _ZYREX_UV_BAKER_PATH)
+if _ZYREX_SPEC is None or _ZYREX_SPEC.loader is None:
+    raise ImportError(f"Unable to load zyrex uv baker module from {_ZYREX_UV_BAKER_PATH}")
+_ZYREX_MODULE = importlib.util.module_from_spec(_ZYREX_SPEC)
+sys.modules[_ZYREX_SPEC.name] = _ZYREX_MODULE
+_ZYREX_SPEC.loader.exec_module(_ZYREX_MODULE)
 
-from zyrex_uv_baker import (
-    bake_tangent_space_normal_map,
-    bake_voxel_pbr_maps,
-    dilate_texture,
-    interpolate_vertex_attributes,
-    rasterize_uv_triangles,
-    sample_sparse_volume_trilinear,
-)
+bake_tangent_space_normal_map = _ZYREX_MODULE.bake_tangent_space_normal_map
+bake_voxel_pbr_maps = _ZYREX_MODULE.bake_voxel_pbr_maps
+dilate_texture = _ZYREX_MODULE.dilate_texture
+interpolate_vertex_attributes = _ZYREX_MODULE.interpolate_vertex_attributes
+rasterize_uv_triangles = _ZYREX_MODULE.rasterize_uv_triangles
+sample_sparse_volume_trilinear = _ZYREX_MODULE.sample_sparse_volume_trilinear
 
 
 def psnr(pred: np.ndarray, target: np.ndarray, eps: float = 1e-12) -> float:
@@ -191,6 +195,153 @@ def _sample_texture(image: np.ndarray, uv: np.ndarray) -> np.ndarray:
     return c0 * (1.0 - wy) + c1 * wy
 
 
+def _sample_texture_torch(image: np.ndarray, uv: np.ndarray) -> np.ndarray:
+    return _sample_texture((np.clip(image, 0.0, 1.0) * 255.0).astype(np.uint8), uv)
+
+
+def _rotation_matrix(yaw_deg: float, pitch_deg: float) -> np.ndarray:
+    yaw = math.radians(yaw_deg)
+    pitch = math.radians(pitch_deg)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    rz = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+    rx = np.array([[1.0, 0.0, 0.0], [0.0, cp, -sp], [0.0, sp, cp]], dtype=np.float32)
+    return rx @ rz
+
+
+def _render_textured_view_cpu(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    uvs: np.ndarray,
+    texture: np.ndarray,
+    yaw_deg: float,
+    pitch_deg: float,
+    resolution: int = 192,
+    focal_px: float = 180.0,
+    camera_distance: float = 2.0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    verts = vertices.astype(np.float32).copy()
+    center = verts.mean(axis=0, keepdims=True)
+    verts -= center
+    scale = max(np.linalg.norm(verts, axis=1).max(), 1e-6)
+    verts /= scale
+
+    rot = _rotation_matrix(yaw_deg, pitch_deg)
+    v = verts @ rot.T
+    z = v[:, 2] + camera_distance
+    z = np.clip(z, 1e-4, None)
+    px = v[:, 0] / z * focal_px + (resolution - 1) * 0.5
+    py = -v[:, 1] / z * focal_px + (resolution - 1) * 0.5
+
+    depth = np.full((resolution, resolution), np.inf, dtype=np.float32)
+    image = np.zeros((resolution, resolution, 3), dtype=np.float32)
+    mask = np.zeros((resolution, resolution), dtype=bool)
+
+    for face in faces:
+        idx0, idx1, idx2 = int(face[0]), int(face[1]), int(face[2])
+        tri = np.array(
+            [[px[idx0], py[idx0]], [px[idx1], py[idx1]], [px[idx2], py[idx2]]],
+            dtype=np.float32,
+        )
+        z_tri = np.array([z[idx0], z[idx1], z[idx2]], dtype=np.float32)
+        uv_tri = np.array([uvs[idx0], uvs[idx1], uvs[idx2]], dtype=np.float32)
+
+        min_x = max(int(np.floor(tri[:, 0].min())), 0)
+        max_x = min(int(np.ceil(tri[:, 0].max())), resolution - 1)
+        min_y = max(int(np.floor(tri[:, 1].min())), 0)
+        max_y = min(int(np.ceil(tri[:, 1].max())), resolution - 1)
+        if min_x > max_x or min_y > max_y:
+            continue
+
+        xs = np.arange(min_x, max_x + 1, dtype=np.float32) + 0.5
+        ys = np.arange(min_y, max_y + 1, dtype=np.float32) + 0.5
+        yy, xx = np.meshgrid(ys, xs, indexing="ij")
+
+        ax, ay = tri[0]
+        bx, by = tri[1]
+        cx, cy = tri[2]
+        denom = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
+        if abs(denom) < 1e-8:
+            continue
+
+        w0 = ((by - cy) * (xx - cx) + (cx - bx) * (yy - cy)) / denom
+        w1 = ((cy - ay) * (xx - cx) + (ax - cx) * (yy - cy)) / denom
+        w2 = 1.0 - w0 - w1
+        inside = (w0 >= -1e-6) & (w1 >= -1e-6) & (w2 >= -1e-6)
+        if not inside.any():
+            continue
+
+        z_interp = w0 * z_tri[0] + w1 * z_tri[1] + w2 * z_tri[2]
+        region_depth = depth[min_y : max_y + 1, min_x : max_x + 1]
+        z_test = inside & (z_interp < region_depth)
+        if not z_test.any():
+            continue
+
+        uv_interp = (
+            uv_tri[0][None, None] * w0[..., None]
+            + uv_tri[1][None, None] * w1[..., None]
+            + uv_tri[2][None, None] * w2[..., None]
+        )
+        uv_valid = uv_interp[z_test]
+        tex = _sample_texture_torch(texture, uv_valid)
+
+        region_img = image[min_y : max_y + 1, min_x : max_x + 1]
+        region_depth[z_test] = z_interp[z_test]
+        region_img[z_test] = tex
+        mask[min_y : max_y + 1, min_x : max_x + 1][z_test] = True
+
+    return image, mask
+
+
+def _rendered_view_metrics(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    uvs: np.ndarray,
+    reference_tex: np.ndarray,
+    rebaked_tex: np.ndarray,
+    views: Iterable[Tuple[float, float]] = ((20.0, 10.0), (140.0, 10.0), (260.0, -12.0)),
+    resolution: int = 192,
+    max_faces: int = 30000,
+) -> Dict[str, object]:
+    total_faces = int(faces.shape[0])
+    if total_faces > max_faces:
+        keep = np.linspace(0, total_faces - 1, max_faces, dtype=np.int64)
+        faces = faces[keep]
+
+    per_view = []
+    psnrs = []
+    ssims = []
+    for yaw, pitch in views:
+        ref_img, ref_mask = _render_textured_view_cpu(
+            vertices, faces, uvs, reference_tex, yaw, pitch, resolution=resolution
+        )
+        reb_img, reb_mask = _render_textured_view_cpu(
+            vertices, faces, uvs, rebaked_tex, yaw, pitch, resolution=resolution
+        )
+        union = ref_mask | reb_mask
+        metrics = masked_metrics(reb_img, ref_img, union)
+        per_view.append(
+            {
+                "yaw_deg": yaw,
+                "pitch_deg": pitch,
+                "coverage_ratio": float(union.mean()),
+                **metrics,
+            }
+        )
+        psnrs.append(metrics["psnr"])
+        ssims.append(metrics["ssim"])
+    return {
+        "status": "measured",
+        "mask": "rendered union mask",
+        "resolution": resolution,
+        "total_faces": total_faces,
+        "faces_rendered": int(faces.shape[0]),
+        "mean_psnr": float(np.mean(psnrs)) if psnrs else 0.0,
+        "mean_ssim": float(np.mean(ssims)) if ssims else 0.0,
+        "per_view": per_view,
+    }
+
+
 def _extract_first_textured_mesh(glb_path: Path):
     import trimesh
 
@@ -208,7 +359,12 @@ def _extract_first_textured_mesh(glb_path: Path):
     raise RuntimeError(f"No textured mesh with UV/baseColorTexture found in {glb_path}")
 
 
-def run_real_asset_rebake(glb_path: Path) -> Dict[str, object]:
+def run_real_asset_rebake(
+    glb_path: Path,
+    render_views: bool = True,
+    render_resolution: int = 192,
+    render_max_faces: int = 30000,
+) -> Dict[str, object]:
     mesh = _extract_first_textured_mesh(glb_path)
     material = mesh.visual.material
     base = np.array(material.baseColorTexture.convert("RGBA"))
@@ -222,31 +378,75 @@ def run_real_asset_rebake(glb_path: Path) -> Dict[str, object]:
     faces = torch.from_numpy(mesh.faces.astype(np.int64))
     raster = rasterize_uv_triangles(uvs, faces, (h, w))
     uv_map = interpolate_vertex_attributes(uvs, faces, raster).cpu().numpy()
-    mask = raster.mask.cpu().numpy().astype(bool)
+    footprint_mask = raster.mask.cpu().numpy().astype(bool)
+    source_coverage_mask = base[..., 3] > 0
+    union_mask = footprint_mask | source_coverage_mask
 
     rebaked_base = np.zeros((h, w, 4), dtype=np.float32)
     rebaked_mr = np.zeros((h, w, 3), dtype=np.float32)
-    if mask.any():
-        uv_valid = uv_map[mask]
-        rebaked_base[mask] = _sample_texture(base, uv_valid)
-        rebaked_mr[mask] = _sample_texture(mr_tex, uv_valid)
+    if footprint_mask.any():
+        uv_valid = uv_map[footprint_mask]
+        rebaked_base[footprint_mask] = _sample_texture(base, uv_valid)
+        rebaked_mr[footprint_mask] = _sample_texture(mr_tex, uv_valid)
 
-    rebaked_base_t = dilate_texture(torch.from_numpy(rebaked_base), torch.from_numpy(mask), iterations=6).numpy()
-    rebaked_mr_t = dilate_texture(torch.from_numpy(rebaked_mr), torch.from_numpy(mask), iterations=6).numpy()
+    rebaked_base_t = dilate_texture(torch.from_numpy(rebaked_base), torch.from_numpy(footprint_mask), iterations=6).numpy()
+    rebaked_mr_t = dilate_texture(torch.from_numpy(rebaked_mr), torch.from_numpy(footprint_mask), iterations=6).numpy()
+    base_ref = base.astype(np.float32) / 255.0
+    mr_ref = mr_tex.astype(np.float32) / 255.0
 
     results: Dict[str, object] = {
         "glb": str(glb_path),
         "texture_size": [h, w],
-        "coverage_ratio": float(mask.mean()),
-        "base_color_rgba": masked_metrics(rebaked_base_t, base.astype(np.float32) / 255.0, mask),
-        "metallic_roughness_rgb": masked_metrics(rebaked_mr_t, mr_tex.astype(np.float32) / 255.0, mask),
+        "coverage": {
+            "footprint_ratio": float(footprint_mask.mean()),
+            "source_alpha_ratio": float(source_coverage_mask.mean()),
+            "union_ratio": float(union_mask.mean()),
+        },
+        "map_metrics": {
+            "legacy_full_texture": {
+                "base_color_rgba": masked_metrics(rebaked_base_t, base_ref, np.ones((h, w), dtype=bool)),
+                "metallic_roughness_rgb": masked_metrics(rebaked_mr_t, mr_ref, np.ones((h, w), dtype=bool)),
+            },
+            "corrected_covered_texels": {
+                "mask": "mesh rasterized UV footprint",
+                "base_color_rgba": masked_metrics(rebaked_base_t, base_ref, footprint_mask),
+                "metallic_roughness_rgb": masked_metrics(rebaked_mr_t, mr_ref, footprint_mask),
+            },
+            "corrected_union_mask": {
+                "mask": "footprint union source-alpha-coverage",
+                "base_color_rgba": masked_metrics(rebaked_base_t, base_ref, union_mask),
+                "metallic_roughness_rgb": masked_metrics(rebaked_mr_t, mr_ref, union_mask),
+            },
+        },
     }
     if normal is not None:
         rebaked_normal = np.zeros((h, w, 3), dtype=np.float32)
-        if mask.any():
-            rebaked_normal[mask] = _sample_texture(normal, uv_map[mask])
-        rebaked_normal_t = dilate_texture(torch.from_numpy(rebaked_normal), torch.from_numpy(mask), iterations=6).numpy()
-        results["normal_rgb"] = masked_metrics(rebaked_normal_t, normal.astype(np.float32) / 255.0, mask)
+        if footprint_mask.any():
+            rebaked_normal[footprint_mask] = _sample_texture(normal, uv_map[footprint_mask])
+        rebaked_normal_t = dilate_texture(torch.from_numpy(rebaked_normal), torch.from_numpy(footprint_mask), iterations=6).numpy()
+        normal_ref = normal.astype(np.float32) / 255.0
+        results["map_metrics"]["legacy_full_texture"]["normal_rgb"] = masked_metrics(rebaked_normal_t, normal_ref, np.ones((h, w), dtype=bool))
+        results["map_metrics"]["corrected_covered_texels"]["normal_rgb"] = masked_metrics(rebaked_normal_t, normal_ref, footprint_mask)
+        results["map_metrics"]["corrected_union_mask"]["normal_rgb"] = masked_metrics(rebaked_normal_t, normal_ref, union_mask)
+
+    if render_views:
+        try:
+            results["rendered_view_metrics"] = _rendered_view_metrics(
+                vertices=mesh.vertices.astype(np.float32),
+                faces=mesh.faces.astype(np.int64),
+                uvs=mesh.visual.uv.astype(np.float32),
+                reference_tex=base_ref[..., :3],
+                rebaked_tex=rebaked_base_t[..., :3],
+                resolution=render_resolution,
+                max_faces=render_max_faces,
+            )
+        except Exception as exc:
+            results["rendered_view_metrics"] = {
+                "status": "pending CPU render comparison",
+                "reason": f"CPU render comparison failed: {exc}",
+            }
+    else:
+        results["rendered_view_metrics"] = {"status": "not_run"}
     return results
 
 
@@ -357,6 +557,9 @@ def main() -> None:
     parser.add_argument("--texture-size", type=int, default=128)
     parser.add_argument("--real-asset", type=Path, default=None, help="Optional GLB path for real-asset re-bake sanity checks.")
     parser.add_argument("--run-gpu", action="store_true", help="Run nvdiffrast vs zyrex GPU comparison when available.")
+    parser.add_argument("--render-resolution", type=int, default=192, help="CPU rendered-view resolution for real-asset comparison.")
+    parser.add_argument("--render-max-faces", type=int, default=30000, help="Maximum faces to use for CPU rendered-view comparisons.")
+    parser.add_argument("--skip-rendered-views", action="store_true", help="Skip CPU rendered-view comparison for real assets.")
     args = parser.parse_args()
 
     report: Dict[str, object] = {
@@ -377,7 +580,12 @@ def main() -> None:
         },
     }
     if args.real_asset is not None:
-        report["real_asset"] = run_real_asset_rebake(args.real_asset)
+        report["real_asset"] = run_real_asset_rebake(
+            args.real_asset,
+            render_views=not args.skip_rendered_views,
+            render_resolution=args.render_resolution,
+            render_max_faces=args.render_max_faces,
+        )
     else:
         report["real_asset"] = {"status": "not_run"}
 

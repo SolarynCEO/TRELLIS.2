@@ -29,9 +29,9 @@ Prototype-only replacement for NVIDIA-licensed UV baking in the **shipping GLB e
 
 Implemented modules:
 
-- `o-voxel/o_voxel/zyrex_baker_backend.py` (plus root helper mirror for tests/scripts)
+- `o-voxel/o_voxel/zyrex_baker_backend.py`
   - Resolves `ZYREX_BAKER` values with default fallback to `nvdiffrast`
-- `o-voxel/o_voxel/zyrex_uv_baker.py` (loaded via `zyrex_uv_baker.py` helper for scripts/tests)
+- `o-voxel/o_voxel/zyrex_uv_baker.py`
   - UV triangle rasterization (torch)
   - Barycentric interpolation (torch)
   - Sparse voxel trilinear sampling (torch `grid_sample`)

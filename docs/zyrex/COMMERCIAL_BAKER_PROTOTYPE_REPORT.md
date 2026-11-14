@@ -47,8 +47,6 @@ Closest alternatives documented in map:
 - `o-voxel/o_voxel/postprocess.py`
 - `o-voxel/o_voxel/zyrex_baker_backend.py`
 - `o-voxel/o_voxel/zyrex_uv_baker.py`
-- `zyrex_baker_backend.py`
-- `zyrex_uv_baker.py`
 - `trellis2/utils/zyrex_baker_compare.py`
 - `tests/test_zyrex_uv_baker.py`
 - `docs/zyrex/COMMERCIAL_BAKER_PROTOTYPE.md`
@@ -65,14 +63,14 @@ python3 -m pytest tests/test_zyrex_uv_baker.py -q
 ## Real output
 
 ```text
-.....                                                                    [100%]
+.......                                                                  [100%]
 =============================== warnings summary ===============================
 tests/test_zyrex_uv_baker.py::test_feature_flag_default_and_override
-  /agent/repos/TRELLIS.2/tests/test_zyrex_uv_baker.py:78: UserWarning: Unsupported ZYREX_BAKER='invalid-backend'; falling back to 'nvdiffrast'. Supported values: ('nvdiffrast', 'pytorch3d', 'kaolin', 'zyrex')
+  /agent/repos/TRELLIS.2/tests/test_zyrex_uv_baker.py:114: UserWarning: Unsupported ZYREX_BAKER='invalid-backend'; falling back to 'nvdiffrast'. Supported values: ('nvdiffrast', 'pytorch3d', 'kaolin', 'zyrex')
     assert resolve_baker_backend() == DEFAULT_BAKER_BACKEND
 
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-5 passed, 1 warning in 1.42s
+7 passed, 1 warning in 1.66s
 ```
 
 # Benchmarks
@@ -81,9 +79,11 @@ tests/test_zyrex_uv_baker.py::test_feature_flag_default_and_override
 
 ```bash
 python3 trellis2/utils/zyrex_baker_compare.py \
-  --output /tmp/zyrex-baker/metrics_cpu.json \
+  --output /tmp/zyrex-baker/metrics_cpu_followup.json \
   --texture-size 128 \
-  --real-asset /tmp/zyrex-baker/warlord_trellis2.glb
+  --real-asset /tmp/zyrex-baker/warlord_trellis2.glb \
+  --render-resolution 96 \
+  --render-max-faces 5000
 ```
 
 ## Measured output (CPU)
@@ -96,13 +96,20 @@ python3 trellis2/utils/zyrex_baker_compare.py \
   - alpha PSNR/SSIM: `99.0 / 1.0`
   - normal PSNR/SSIM: `99.0 / 1.0`
   - normal orientation check: `true`
-  - processing time: `0.012976075999972636 s`
-  - peak RSS: `554.61328125 MB`
+  - processing time: `0.014618692000112787 s`
+  - peak RSS: `555.08984375 MB`
 - Real asset (`warlord_trellis2.glb`) re-bake sanity:
   - texture size: `2048x2048`
-  - UV coverage ratio: `0.5422093868255615`
-  - base color RGBA PSNR/SSIM: `18.608159288557747 / 0.9564441442489624`
-  - metallic-roughness RGB PSNR/SSIM: `26.110288005954278 / 0.9937278032302856`
+  - mesh-footprint UV coverage ratio: `0.5422093868255615`
+  - source alpha coverage ratio: `0.999993085861206`
+  - union coverage ratio: `0.9999980926513672`
+  - **legacy/full-texture** base color RGBA PSNR/SSIM: `16.412878788940326 / 0.9277622699737549`
+  - **corrected/covered-texels (footprint)** base color RGBA PSNR/SSIM: `18.608159288557747 / 0.9564441442489624`
+  - corrected covered-texels metallic-roughness RGB PSNR/SSIM: `26.110288005954278 / 0.9937278032302856`
+  - CPU rendered-view comparison (3 fixed views, union render mask):
+    - mean PSNR: `17.510401485102008`
+    - mean SSIM: `0.10918882737557094`
+    - face budget for CPU render: `5000 / 194529`
 
 ## GPU-side comparison status
 
@@ -125,7 +132,8 @@ The comparison harness writes explicit pending fields instead of estimating valu
 
 - Prototype shipping integration is limited to `o_voxel.postprocess.to_glb`.
 - `pytorch3d` and `kaolin` backend values are currently placeholders (explicitly not implemented).
-- No CUDA on this VM, so direct side-by-side nvdiffrast vs zyrex metrics and rendered-view metrics remain pending.
+- No CUDA on this VM, so direct side-by-side nvdiffrast vs zyrex metrics remain pending.
+- CPU rendered-view comparison is approximate (face budget cap) to keep runtime feasible on CPU-only hosts.
 - Texturing and renderer subsystems that use `nvdiffrast`/`nvdiffrec_render` are mapped but not replaced in this PR.
 
 # Licensing implications
@@ -139,7 +147,8 @@ The comparison harness writes explicit pending fields instead of estimating valu
 
 - **Partially complete / prototype state**:
   - CPU synthetic and real-asset sanity validation: complete
-  - GPU equivalence against nvdiffrast and rendered-view fidelity checks: **pending GPU run**
+  - CPU rendered-view comparison: complete (approximate, face-capped)
+  - GPU equivalence against nvdiffrast: **pending GPU run**
   - Full renderer stack migration away from nvdiffrast/nvdiffrec: **not started in this PR**
 
 # Next task
