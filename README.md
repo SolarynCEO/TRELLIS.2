@@ -182,6 +182,18 @@ python app.py
 
 Then, you can access the demo at the address shown in the terminal.
 
+#### Low-VRAM mode (Zyrex fork)
+
+This fork adds an opt-in `8gb` VRAM profile for constrained GPUs.
+
+- Enable via environment variable: `ZYREX_LOW_VRAM=1`
+- Or pass `vram_profile="8gb"` to `pipeline.run(...)`
+- For Windows / no flash-attn setups, set `ATTN_BACKEND=sdpa`
+
+Detailed usage and benchmark instructions are documented in:
+
+- [`docs/zyrex/LOW_VRAM_MODE.md`](docs/zyrex/LOW_VRAM_MODE.md)
+
 ### 2. PBR Texture Generation
 
 Please refer to the [example_texturing.py](example_texturing.py) for an example of how to generate PBR textures for a given 3D shape. Also, you can use the [app_texturing.py](app_texturing.py) to run a web demo for PBR texture generation.

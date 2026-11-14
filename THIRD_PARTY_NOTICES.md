@@ -7,6 +7,7 @@ It is a technical compliance aid, not legal advice.
 
 - Repository scripts/configs inspected:
   - `/workspace/setup.sh`
+  - `/workspace/requirements.txt`
   - `/workspace/data_toolkit/setup.sh`
   - `/workspace/o-voxel/pyproject.toml`
   - `/workspace/trellis2/pipelines/*.py`
@@ -36,15 +37,16 @@ Status labels:
 | `opencv-python-headless` | `setup.sh --basic`, `data_toolkit/setup.sh` | https://pypi.org/project/opencv-python-headless/ | Apache-2.0 (metadata) | Permissive; generally allowed |
 | `ninja` | `setup.sh --basic` | https://pypi.org/project/ninja/ | **Unverified** (not installed) | **Unverified** |
 | `trimesh` | `setup.sh --basic` | https://pypi.org/project/trimesh/ | MIT (metadata) | Permissive; generally allowed |
-| `transformers` | `setup.sh --basic` | https://pypi.org/project/transformers/ | Apache-2.0 (metadata) | Permissive; generally allowed |
+| `transformers>=4.56,<5` | `setup.sh --basic`, `requirements.txt` | https://pypi.org/project/transformers/ | Apache-2.0 (metadata) | Permissive; generally allowed |
 | `gradio==6.0.1` | `setup.sh --basic` | https://pypi.org/project/gradio/ | **Unverified** (not installed) | **Unverified** |
 | `tensorboard` | `setup.sh --basic` | https://pypi.org/project/tensorboard/ | **Unverified** (not installed) | **Unverified** |
 | `pandas` | `setup.sh --basic`, `data_toolkit/setup.sh` | https://pypi.org/project/pandas/ | **Unverified** (not installed) | **Unverified** |
 | `lpips` | `setup.sh --basic` | https://pypi.org/project/lpips/ | **Unverified** (not installed) | **Unverified** |
 | `zstandard` | `setup.sh --basic`, `o-voxel/pyproject.toml` | https://pypi.org/project/zstandard/ | **Unverified** (not installed) | **Unverified** |
 | `pillow-simd` | `setup.sh --basic` | https://pypi.org/project/Pillow-SIMD/ | **Unverified** (not installed) | **Unverified** |
-| `kornia` | `setup.sh --basic` | https://pypi.org/project/kornia/ | **Unverified** (not installed) | **Unverified** |
-| `timm` | `setup.sh --basic` | https://pypi.org/project/timm/ | **Unverified** (not installed) | **Unverified** |
+| `einops` | `setup.sh --basic`, `requirements.txt` | https://pypi.org/project/einops/ | **Unverified** (not installed) | **Unverified** |
+| `kornia` | `setup.sh --basic`, `requirements.txt` | https://pypi.org/project/kornia/ | **Unverified** (not installed) | **Unverified** |
+| `timm` | `setup.sh --basic`, `requirements.txt` | https://pypi.org/project/timm/ | **Unverified** (not installed) | **Unverified** |
 | `open3d` | `data_toolkit/setup.sh` | https://pypi.org/project/open3d/ | **Unverified** (not installed) | **Unverified** |
 | `objaverse` | `data_toolkit/setup.sh` | https://pypi.org/project/objaverse/ | **Unverified** (not installed) | **Unverified** |
 | `huggingface_hub[cli]` | `data_toolkit/setup.sh` | https://pypi.org/project/huggingface-hub/ | Apache-2.0 (metadata) | Permissive; generally allowed |

@@ -1,5 +1,8 @@
 from typing import *
 import torch
+import torch.nn.functional as F
+import math
+import warnings
 from .. import VarLenTensor
 from .. import config
 
@@ -7,6 +10,42 @@ from .. import config
 __all__ = [
     'sparse_scaled_dot_product_attention',
 ]
+
+
+def _varlen_attention_fallback(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_seqlen: List[int],
+    kv_seqlen: List[int],
+    backend: Literal['sdpa', 'naive'],
+) -> torch.Tensor:
+    out_chunks = []
+    q_start = 0
+    kv_start = 0
+    for q_len, kv_len in zip(q_seqlen, kv_seqlen):
+        q_chunk = q[q_start:q_start + q_len].unsqueeze(0).permute(0, 2, 1, 3)   # [1, H, Lq, C]
+        k_chunk = k[kv_start:kv_start + kv_len].unsqueeze(0).permute(0, 2, 1, 3) # [1, H, Lk, C]
+        v_chunk = v[kv_start:kv_start + kv_len].unsqueeze(0).permute(0, 2, 1, 3) # [1, H, Lk, C]
+        if backend == 'sdpa':
+            out_chunk = F.scaled_dot_product_attention(q_chunk, k_chunk, v_chunk)
+        else:
+            scale = 1.0 / math.sqrt(q_chunk.shape[-1])
+            attn_weight = torch.softmax((q_chunk @ k_chunk.transpose(-2, -1)) * scale, dim=-1)
+            out_chunk = attn_weight @ v_chunk
+        out_chunks.append(out_chunk.permute(0, 2, 1, 3).squeeze(0))
+        q_start += q_len
+        kv_start += kv_len
+    return torch.cat(out_chunks, dim=0)
+
+
+def _fallback_sparse_backend_to_sdpa(unavailable_backend: str, import_error: Exception) -> None:
+    warnings.warn(
+        f"[SPARSE_ATTENTION] Backend '{unavailable_backend}' is unavailable ({import_error}). Falling back to 'sdpa'.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    config.set_attn_backend('sdpa')
 
 
 @overload
@@ -171,7 +210,11 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
 
     if config.ATTN == 'xformers':
         if 'xops' not in globals():
-            import xformers.ops as xops
+            try:
+                import xformers.ops as xops
+            except Exception as e:
+                _fallback_sparse_backend_to_sdpa('xformers', e)
+                return sparse_scaled_dot_product_attention(*args, **kwargs)
         if num_all_args == 1:
             q, k, v = qkv.unbind(dim=1)
         elif num_all_args == 2:
@@ -183,7 +226,11 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
         out = xops.memory_efficient_attention(q, k, v, mask)[0]
     elif config.ATTN == 'flash_attn':
         if 'flash_attn' not in globals():
-            import flash_attn
+            try:
+                import flash_attn
+            except Exception as e:
+                _fallback_sparse_backend_to_sdpa('flash_attn', e)
+                return sparse_scaled_dot_product_attention(*args, **kwargs)
         cu_seqlens_q = torch.cat([torch.tensor([0]), torch.cumsum(torch.tensor(q_seqlen), dim=0)]).int().to(device)
         if num_all_args in [2, 3]:
             cu_seqlens_kv = torch.cat([torch.tensor([0]), torch.cumsum(torch.tensor(kv_seqlen), dim=0)]).int().to(device)
@@ -195,7 +242,11 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
             out = flash_attn.flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max(q_seqlen), max(kv_seqlen))
     elif config.ATTN == 'flash_attn_3':
         if 'flash_attn_3' not in globals():
-            import flash_attn_interface as flash_attn_3
+            try:
+                import flash_attn_interface as flash_attn_3
+            except Exception as e:
+                _fallback_sparse_backend_to_sdpa('flash_attn_3', e)
+                return sparse_scaled_dot_product_attention(*args, **kwargs)
         cu_seqlens_q = torch.cat([torch.tensor([0]), torch.cumsum(torch.tensor(q_seqlen), dim=0)]).int().to(device)
         if num_all_args == 1:
             q, k, v = qkv.unbind(dim=1)
@@ -211,6 +262,12 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
             max_q_seqlen = max(q_seqlen)
             max_kv_seqlen = max(kv_seqlen)
         out = flash_attn_3.flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_q_seqlen, max_kv_seqlen)
+    elif config.ATTN in ['sdpa', 'naive']:
+        if num_all_args == 1:
+            q, k, v = qkv.unbind(dim=1)
+        elif num_all_args == 2:
+            k, v = kv.unbind(dim=1)
+        out = _varlen_attention_fallback(q, k, v, q_seqlen, kv_seqlen, config.ATTN)
     else:
         raise ValueError(f"Unknown attention module: {config.ATTN}")
     
