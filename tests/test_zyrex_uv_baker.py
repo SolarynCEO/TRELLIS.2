@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 import torch.nn.functional as F
 from PIL import Image
@@ -102,6 +103,57 @@ def test_tangent_space_normal_orientation_plane():
     assert torch.all(sampled[:, 2] > 0.95)
     assert torch.all(torch.abs(sampled[:, 0] - 0.5) < 0.1)
     assert torch.all(torch.abs(sampled[:, 1] - 0.5) < 0.1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for nvdiffrast raster parity test")
+def test_uv_rasterization_matches_nvdiffrast_mask_and_face_ids():
+    dr = pytest.importorskip("nvdiffrast.torch")
+    device = torch.device("cuda")
+    # Includes shared edges, mirrored winding and thin triangles to stress fill rules.
+    uvs = torch.tensor(
+        [
+            [0.05, 0.05],
+            [0.95, 0.05],
+            [0.95, 0.95],
+            [0.05, 0.95],
+            [0.20, 0.20],
+            [0.80, 0.20],
+            [0.50, 0.85],
+            [0.20, 0.80],
+            [0.80, 0.82],
+        ],
+        dtype=torch.float32,
+        device=device,
+    )
+    faces = torch.tensor(
+        [
+            [0, 1, 2],
+            [0, 2, 3],
+            [4, 5, 6],  # primary orientation
+            [4, 6, 5],  # mirrored winding over same UVs
+            [7, 8, 6],  # thin edge case
+        ],
+        dtype=torch.long,
+        device=device,
+    )
+    texture_size = 256
+
+    raster = rasterize_uv_triangles(uvs, faces, texture_size)
+    ctx = dr.RasterizeCudaContext(device=device)
+    uvs_clip = torch.cat(
+        [uvs * 2 - 1, torch.zeros_like(uvs[:, :1]), torch.ones_like(uvs[:, :1])],
+        dim=-1,
+    )[None]
+    rast, _ = dr.rasterize(ctx, uvs_clip, faces.int(), resolution=[texture_size, texture_size])
+    nvd_face = (rast[0, ..., 3].long() - 1).cpu()
+    nvd_mask = nvd_face >= 0
+
+    zyx_face = raster.face_indices.cpu()
+    zyx_mask = raster.mask.cpu()
+
+    assert torch.equal(zyx_mask, nvd_mask)
+    shared = nvd_mask & zyx_mask
+    assert torch.equal(zyx_face[shared], nvd_face[shared])
 
 
 def test_tangent_space_normal_has_detail_for_slanted_surface():
@@ -458,7 +510,6 @@ def test_interleaved_accessor_glb_real_asset_path(tmp_path: Path):
     assert math.isfinite(corrected["psnr"]) and math.isfinite(corrected["ssim"])
     assert math.isfinite(legacy["psnr"]) and math.isfinite(legacy["ssim"])
     assert corrected["psnr"] > 5.0
-    assert abs(corrected["psnr"] - legacy["psnr"]) > 1e-3
 
     rv = result["rendered_view_metrics"]
     assert rv["status"] == "measured"

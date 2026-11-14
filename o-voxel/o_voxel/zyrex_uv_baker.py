@@ -50,8 +50,10 @@ def rasterize_uv_triangles(
 
     faces_long = faces.long()
     uvs_px = uvs[:, :2].to(dtype=torch.float32).clone()
-    uvs_px[:, 0] = uvs_px[:, 0] * (width - 1)
-    uvs_px[:, 1] = uvs_px[:, 1] * (height - 1)
+    # Match rasterization pixel-center convention used by clip-space backends:
+    # texel center i maps to UV (i + 0.5) / size.
+    uvs_px[:, 0] = uvs_px[:, 0] * width - 0.5
+    uvs_px[:, 1] = uvs_px[:, 1] * height - 0.5
     tris = uvs_px[faces_long]  # [F, 3, 2]
 
     num_pixels = height * width
@@ -116,8 +118,8 @@ def rasterize_uv_triangles(
         min_y_rep = torch.repeat_interleave(min_y_v, areas_v)
         x_int = min_x_rep + x_local
         y_int = min_y_rep + y_local
-        x = x_int.to(torch.float32) + 0.5
-        y = y_int.to(torch.float32) + 0.5
+        x = x_int.to(torch.float32)
+        y = y_int.to(torch.float32)
 
         tri = tri_valid[compact_rep]
         v0 = tri[:, 0]
@@ -166,6 +168,14 @@ def rasterize_uv_triangles(
         w1 = -e1 / safe_area
         w2 = -e2 / safe_area
         bary = torch.stack([w0[inside], w1[inside], w2[inside]], dim=-1).to(dtype=dtype)
+        # If triangle winding was swapped for coverage tests, remap bary weights
+        # back to original face vertex order (v0, v1_orig, v2_orig).
+        swapped_inside = swap[inside]
+        if swapped_inside.any():
+            b1 = bary[:, 1].clone()
+            b2 = bary[:, 2].clone()
+            bary[:, 1] = torch.where(swapped_inside, b2, b1)
+            bary[:, 2] = torch.where(swapped_inside, b1, b2)
 
         unique_pix, inv = torch.unique(pix_idx, sorted=False, return_inverse=True)
         if unique_pix.numel() == 0:

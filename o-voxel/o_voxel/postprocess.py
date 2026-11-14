@@ -216,7 +216,8 @@ def _bake_maps_nvdiffrast(
         rast_chunk[..., 3:4] += i
         rast = torch.where(mask_chunk, rast_chunk, rast)
 
-    mask = rast[0, ..., 3] > 0
+    face_indices = rast[0, ..., 3].long() - 1
+    mask = face_indices >= 0
     pos = dr.interpolate(out_vertices.unsqueeze(0), rast, out_faces)[0][0]
     valid_pos = pos[mask]
     _, face_id, uvw = bvh.unsigned_distance(valid_pos, return_uvw=True)
@@ -231,6 +232,8 @@ def _bake_maps_nvdiffrast(
         grid=((valid_pos - aabb[0]) / voxel_size).reshape(1, -1, 3),
         mode="trilinear",
     )
+    pos_mapped = torch.zeros(texture_size, texture_size, 3, dtype=valid_pos.dtype, device=valid_pos.device)
+    pos_mapped[mask] = valid_pos
     mask_np = mask.cpu().numpy()
     base_color = np.clip(attrs[..., attr_layout["base_color"]].cpu().numpy() * 255, 0, 255).astype(np.uint8)
     metallic = np.clip(attrs[..., attr_layout["metallic"]].cpu().numpy() * 255, 0, 255).astype(np.uint8)
@@ -238,6 +241,9 @@ def _bake_maps_nvdiffrast(
     alpha = np.clip(attrs[..., attr_layout["alpha"]].cpu().numpy() * 255, 0, 255).astype(np.uint8)
     return {
         "mask_raw": mask_np,
+        "face_indices_raw": face_indices.cpu().numpy().astype(np.int32),
+        "sample_positions_raw": pos_mapped.cpu().numpy().astype(np.float32),
+        "sampled_attrs_raw": attrs.cpu().numpy().astype(np.float32),
         "maps_raw": {
             "base_color": base_color,
             "metallic": metallic,
@@ -257,9 +263,12 @@ def _bake_maps_zyrex(
     voxel_size: torch.Tensor,
     grid_size: torch.Tensor,
     texture_size: int,
-    sample_chunk_size: int,
 ) -> Dict[str, Any]:
-    from .zyrex_uv_baker import bake_voxel_pbr_maps
+    from .zyrex_uv_baker import (
+        bake_tangent_space_normal_map,
+        interpolate_vertex_attributes,
+        rasterize_uv_triangles,
+    )
 
     out_vertices = prepared["out_vertices"]
     out_faces = prepared["out_faces"]
@@ -281,30 +290,40 @@ def _bake_maps_zyrex(
         orig_tri_verts = src_vertices[src_faces[face_id.long()]]
         return (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
 
-    baked = bake_voxel_pbr_maps(
+    raster = rasterize_uv_triangles(out_uvs, out_faces.long(), texture_size)
+    pos = interpolate_vertex_attributes(out_vertices, out_faces.long(), raster)
+    query_positions = pos[raster.mask]
+    query_positions = map_to_original_surface(query_positions)
+
+    attrs = torch.zeros(texture_size, texture_size, attr_volume.shape[1], device=out_vertices.device, dtype=attr_volume.dtype)
+    attrs[raster.mask] = grid_sample_3d(
+        attr_volume,
+        torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=-1),
+        shape=torch.Size([1, attr_volume.shape[1], *grid_size.tolist()]),
+        grid=((query_positions - aabb[0]) / voxel_size).reshape(1, -1, 3),
+        mode="trilinear",
+    )
+    normal = bake_tangent_space_normal_map(
         vertices=out_vertices,
         faces=out_faces.long(),
         uvs=out_uvs,
         vertex_normals=out_normals_t,
-        attr_volume=attr_volume,
-        coords=coords,
-        attr_layout=attr_layout,
-        aabb=aabb,
-        voxel_size=voxel_size,
-        grid_size=grid_size,
-        texture_size=texture_size,
-        seam_padding_iterations=0,
-        position_mapper=map_to_original_surface,
-        sample_chunk_size=sample_chunk_size,
+        raster=raster,
     )
-    mask_np = baked["mask"].cpu().numpy()
-    base_color = torch.clamp(baked["base_color"] * 255.0, 0.0, 255.0).byte().cpu().numpy()
-    metallic = torch.clamp(baked["metallic"] * 255.0, 0.0, 255.0).byte().cpu().numpy()
-    roughness = torch.clamp(baked["roughness"] * 255.0, 0.0, 255.0).byte().cpu().numpy()
-    alpha = torch.clamp(baked["alpha"] * 255.0, 0.0, 255.0).byte().cpu().numpy()
-    normal = torch.clamp(baked["normal"] * 255.0, 0.0, 255.0).byte().cpu().numpy()
+    pos_mapped = torch.zeros(texture_size, texture_size, 3, dtype=query_positions.dtype, device=query_positions.device)
+    pos_mapped[raster.mask] = query_positions
+
+    mask_np = raster.mask.cpu().numpy()
+    base_color = torch.clamp(attrs[..., attr_layout["base_color"]] * 255.0, 0.0, 255.0).byte().cpu().numpy()
+    metallic = torch.clamp(attrs[..., attr_layout["metallic"]] * 255.0, 0.0, 255.0).byte().cpu().numpy()
+    roughness = torch.clamp(attrs[..., attr_layout["roughness"]] * 255.0, 0.0, 255.0).byte().cpu().numpy()
+    alpha = torch.clamp(attrs[..., attr_layout["alpha"]] * 255.0, 0.0, 255.0).byte().cpu().numpy()
+    normal = torch.clamp(normal * 255.0, 0.0, 255.0).byte().cpu().numpy()
     return {
         "mask_raw": mask_np,
+        "face_indices_raw": raster.face_indices.cpu().numpy().astype(np.int32),
+        "sample_positions_raw": pos_mapped.cpu().numpy().astype(np.float32),
+        "sampled_attrs_raw": attrs.cpu().numpy().astype(np.float32),
         "maps_raw": {
             "base_color": base_color,
             "metallic": metallic,
@@ -338,7 +357,6 @@ def bake_glb_maps_from_prepared(
             voxel_size,
             grid_size,
             texture_size,
-            sample_chunk_size=_resolve_zyrex_sample_chunk_size(),
         )
     else:
         raise NotImplementedError(
@@ -368,6 +386,9 @@ def bake_glb_maps_from_prepared(
         "backend": backend,
         "hashes": prepared["hashes"],
         "mask_raw": mask_raw,
+        "face_indices_raw": baked.get("face_indices_raw"),
+        "sample_positions_raw": baked.get("sample_positions_raw"),
+        "sampled_attrs_raw": baked.get("sampled_attrs_raw"),
         "maps_raw": maps_raw,
         "maps_filled": maps_filled,
     }

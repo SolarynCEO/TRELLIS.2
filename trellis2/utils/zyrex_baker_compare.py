@@ -370,6 +370,28 @@ def _save_side_by_side_png(reference: np.ndarray, candidate: np.ndarray, out_pat
     Image.fromarray(panel).save(out_path)
 
 
+def _save_bool_png(mask: np.ndarray, out_path: Path) -> None:
+    img = (mask.astype(np.uint8) * 255)
+    Image.fromarray(img, mode="L").save(out_path)
+
+
+def _save_float_heat_png(values: np.ndarray, out_path: Path, valid_mask: Optional[np.ndarray] = None) -> None:
+    arr = np.array(values, dtype=np.float32)
+    if valid_mask is not None:
+        valid = valid_mask.astype(bool)
+        if valid.any():
+            vmax = float(np.max(arr[valid]))
+        else:
+            vmax = 0.0
+        norm = np.zeros_like(arr, dtype=np.float32)
+        if vmax > 0.0:
+            norm[valid] = np.clip(arr[valid] / vmax, 0.0, 1.0)
+    else:
+        vmax = float(np.max(arr))
+        norm = arr / vmax if vmax > 0 else np.zeros_like(arr, dtype=np.float32)
+    Image.fromarray(np.clip(norm * 255.0, 0.0, 255.0).astype(np.uint8), mode="L").save(out_path)
+
+
 def _load_voxel_input(npz_path: Path) -> Dict[str, object]:
     data = np.load(npz_path, allow_pickle=True)
     layout_json = str(data["attr_layout_json"][0])
@@ -909,7 +931,18 @@ def run_gpu_comparison_voxel_input(
     zyx_mr = np.concatenate([np.zeros_like(zyx_m), zyx_r, zyx_m], axis=-1)
     zyx_normal = get_map(zyx_dbg["maps_filled"], "normal")
 
+    nvd_base_raw = get_map(nvd_dbg["maps_raw"], "base_color")
+    nvd_m_raw = get_map(nvd_dbg["maps_raw"], "metallic")
+    nvd_r_raw = get_map(nvd_dbg["maps_raw"], "roughness")
+    nvd_mr_raw = np.concatenate([np.zeros_like(nvd_m_raw), nvd_r_raw, nvd_m_raw], axis=-1)
+    zyx_base_raw = get_map(zyx_dbg["maps_raw"], "base_color")
+    zyx_m_raw = get_map(zyx_dbg["maps_raw"], "metallic")
+    zyx_r_raw = get_map(zyx_dbg["maps_raw"], "roughness")
+    zyx_mr_raw = np.concatenate([np.zeros_like(zyx_m_raw), zyx_r_raw, zyx_m_raw], axis=-1)
+
     output_dir.mkdir(parents=True, exist_ok=True)
+    debug_dir = output_dir / "debug_dumps"
+    debug_dir.mkdir(parents=True, exist_ok=True)
     png_paths = {
         "base_color": output_dir / "gpu_voxel_base_color_side_by_side.png",
         "metallic_roughness": output_dir / "gpu_voxel_metallic_roughness_side_by_side.png",
@@ -919,6 +952,49 @@ def run_gpu_comparison_voxel_input(
     if nvd_dbg["maps_filled"].get("normal") is not None:
         png_paths["normal"] = output_dir / "gpu_voxel_normal_side_by_side.png"
         _save_side_by_side_png(nvd_normal, zyx_normal, png_paths["normal"])
+
+    nvd_face = np.array(nvd_dbg.get("face_indices_raw"), dtype=np.int32)
+    zyx_face = np.array(zyx_dbg.get("face_indices_raw"), dtype=np.int32)
+    face_mismatch = overlap_mask & (nvd_face != zyx_face)
+    mask_xor = np.logical_xor(nvd_mask, zyx_mask)
+
+    nvd_pos = np.array(nvd_dbg.get("sample_positions_raw"), dtype=np.float32)
+    zyx_pos = np.array(zyx_dbg.get("sample_positions_raw"), dtype=np.float32)
+    pos_diff_l2 = np.linalg.norm(zyx_pos - nvd_pos, axis=-1)
+    pos_diff_l2 *= overlap_mask.astype(np.float32)
+
+    nvd_attrs = np.array(nvd_dbg.get("sampled_attrs_raw"), dtype=np.float32)
+    zyx_attrs = np.array(zyx_dbg.get("sampled_attrs_raw"), dtype=np.float32)
+    attr_diff_l2 = np.linalg.norm(zyx_attrs - nvd_attrs, axis=-1)
+    attr_diff_l2 *= overlap_mask.astype(np.float32)
+    attr_diff_base_l2 = np.linalg.norm(
+        zyx_attrs[..., attr_layout["base_color"]] - nvd_attrs[..., attr_layout["base_color"]],
+        axis=-1,
+    ) * overlap_mask.astype(np.float32)
+
+    debug_npz = debug_dir / "voxel_bake_debug_diffs.npz"
+    np.savez_compressed(
+        debug_npz,
+        mask_nvd=nvd_mask.astype(np.uint8),
+        mask_zyrex=zyx_mask.astype(np.uint8),
+        mask_xor=mask_xor.astype(np.uint8),
+        face_nvd=nvd_face,
+        face_zyrex=zyx_face,
+        face_mismatch=face_mismatch.astype(np.uint8),
+        position_diff_l2=pos_diff_l2.astype(np.float32),
+        attribute_diff_l2=attr_diff_l2.astype(np.float32),
+        attribute_base_color_diff_l2=attr_diff_base_l2.astype(np.float32),
+    )
+    mask_xor_png = debug_dir / "mask_xor.png"
+    face_mismatch_png = debug_dir / "face_id_mismatch.png"
+    pos_diff_png = debug_dir / "position_diff_l2.png"
+    attr_diff_png = debug_dir / "attribute_diff_l2.png"
+    attr_base_diff_png = debug_dir / "attribute_base_color_diff_l2.png"
+    _save_bool_png(mask_xor, mask_xor_png)
+    _save_bool_png(face_mismatch, face_mismatch_png)
+    _save_float_heat_png(pos_diff_l2, pos_diff_png, valid_mask=overlap_mask)
+    _save_float_heat_png(attr_diff_l2, attr_diff_png, valid_mask=overlap_mask)
+    _save_float_heat_png(attr_diff_base_l2, attr_base_diff_png, valid_mask=overlap_mask)
 
     def map_metric_pack(pred: np.ndarray, ref: np.ndarray) -> Dict[str, object]:
         return {
@@ -976,6 +1052,28 @@ def run_gpu_comparison_voxel_input(
             "base_color": map_metric_pack(zyx_base, nvd_base),
             "metallic_roughness": map_metric_pack(zyx_mr, nvd_mr),
             "normal": normal_metrics,
+        },
+        "raw_map_metrics_vs_nvdiffrast": {
+            "base_color": map_metric_pack(zyx_base_raw, nvd_base_raw),
+            "metallic_roughness": map_metric_pack(zyx_mr_raw, nvd_mr_raw),
+        },
+        "debug_dumps": {
+            "npz": str(debug_npz.resolve()),
+            "mask_xor_png": str(mask_xor_png.resolve()),
+            "face_id_mismatch_png": str(face_mismatch_png.resolve()),
+            "position_diff_l2_png": str(pos_diff_png.resolve()),
+            "attribute_diff_l2_png": str(attr_diff_png.resolve()),
+            "attribute_base_color_diff_l2_png": str(attr_base_diff_png.resolve()),
+            "stats": {
+                "mask_xor_ratio": float(mask_xor.mean()),
+                "face_mismatch_ratio_on_overlap": (
+                    float(face_mismatch.sum() / overlap_mask.sum()) if overlap_mask.any() else 0.0
+                ),
+                "position_diff_l2_mean_on_overlap": float(pos_diff_l2[overlap_mask].mean()) if overlap_mask.any() else 0.0,
+                "position_diff_l2_max_on_overlap": float(pos_diff_l2[overlap_mask].max()) if overlap_mask.any() else 0.0,
+                "attribute_diff_l2_mean_on_overlap": float(attr_diff_l2[overlap_mask].mean()) if overlap_mask.any() else 0.0,
+                "attribute_diff_l2_max_on_overlap": float(attr_diff_l2[overlap_mask].max()) if overlap_mask.any() else 0.0,
+            },
         },
         "side_by_side_pngs": {k: str(v.resolve()) for k, v in png_paths.items()},
     }
