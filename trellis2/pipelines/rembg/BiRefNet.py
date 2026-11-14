@@ -73,6 +73,10 @@ class BiRefNet:
     def cpu(self):
         return self.to("cpu")
 
+    @property
+    def device(self):
+        return next(self.model.parameters()).device
+
     def _verify_remote_code_hashes(self) -> None:
         key = (self.model_name, self.revision)
         expected_hashes = PINNED_REMOTE_CODE_SHA256.get(key)
@@ -108,7 +112,7 @@ class BiRefNet:
     def __call__(self, image: Image.Image) -> Image.Image:
         image_size = image.size
         model_dtype = next(self.model.parameters()).dtype
-        input_images = self.transform_image(image).unsqueeze(0).to(self._device, dtype=model_dtype)
+        input_images = self.transform_image(image).unsqueeze(0).to(self.device, dtype=model_dtype)
         # Prediction
         with torch.no_grad():
             preds = self.model(input_images)[-1].sigmoid().cpu()

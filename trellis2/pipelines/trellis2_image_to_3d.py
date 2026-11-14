@@ -1,4 +1,7 @@
 from typing import *
+import os
+import time
+from contextlib import nullcontext
 import torch
 import torch.nn as nn
 from PIL import Image
@@ -37,6 +40,16 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         'tex_slat_flow_model_1024',
         'tex_slat_decoder',
     ]
+    vram_profiles: Dict[str, Dict[str, Any]] = {
+        '8gb': {
+            'force_low_vram': True,
+            'default_pipeline_type': '512',
+            'max_num_tokens': 32768,
+            'empty_cache_between_stages': True,
+            'autocast_dtype': 'fp16',
+            'prefer_attention_backend': 'sdpa',
+        },
+    }
 
     def __init__(
         self,
@@ -53,6 +66,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         rembg_model: Callable = None,
         low_vram: bool = True,
         default_pipeline_type: str = '1024_cascade',
+        vram_profile: Optional[str] = None,
     ):
         if models is None:
             return
@@ -69,6 +83,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         self.rembg_model = rembg_model
         self.low_vram = low_vram
         self.default_pipeline_type = default_pipeline_type
+        self.vram_profile = self._resolve_vram_profile(vram_profile)
+        self.last_run_stats: Dict[str, Any] = {}
         self.pbr_attr_layout = {
             'base_color': slice(0, 3),
             'metallic': slice(3, 4),
@@ -107,6 +123,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         
         pipeline.low_vram = args.get('low_vram', True)
         pipeline.default_pipeline_type = args.get('default_pipeline_type', '1024_cascade')
+        pipeline.vram_profile = pipeline._resolve_vram_profile(args.get('vram_profile'))
+        pipeline.last_run_stats = {}
         pipeline.pbr_attr_layout = {
             'base_color': slice(0, 3),
             'metallic': slice(3, 4),
@@ -116,6 +134,99 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         pipeline._device = 'cpu'
 
         return pipeline
+
+    @staticmethod
+    def _is_truthy(value: Optional[str]) -> bool:
+        if value is None:
+            return False
+        return value.strip().lower() in {'1', 'true', 'yes', 'on'}
+
+    def _resolve_vram_profile(self, requested: Optional[str]) -> Optional[str]:
+        if requested is None:
+            if self._is_truthy(os.environ.get("ZYREX_LOW_VRAM")):
+                return '8gb'
+            return None
+        requested = requested.strip().lower()
+        if requested in {'', '0', 'false', 'off', 'none', 'default'}:
+            return None
+        if requested not in self.vram_profiles:
+            raise ValueError(f"Unsupported VRAM profile: {requested}. Available: {', '.join(sorted(self.vram_profiles))}")
+        return requested
+
+    def _resolve_autocast_dtype(self, profile_cfg: Dict[str, Any]) -> Optional[torch.dtype]:
+        requested = os.environ.get("ZYREX_LOW_VRAM_DTYPE", profile_cfg.get('autocast_dtype'))
+        if requested is None:
+            return None
+        requested = str(requested).strip().lower()
+        if requested in {'', '0', 'false', 'off', 'none'}:
+            return None
+        if requested == 'fp16':
+            return torch.float16
+        if requested == 'bf16':
+            return torch.bfloat16
+        raise ValueError("ZYREX_LOW_VRAM_DTYPE must be one of: fp16, bf16, none")
+
+    def _dtype_name(self, dtype: Optional[torch.dtype]) -> Optional[str]:
+        if dtype is None:
+            return None
+        return {
+            torch.float16: 'fp16',
+            torch.bfloat16: 'bf16',
+            torch.float32: 'fp32',
+        }.get(dtype, str(dtype))
+
+    def _is_cuda_runtime_active(self) -> bool:
+        if not torch.cuda.is_available():
+            return False
+        device = self.device
+        if isinstance(device, torch.device):
+            return device.type == "cuda"
+        return str(device).startswith("cuda")
+
+    def _configure_attention_backend_for_profile(self, profile_cfg: Dict[str, Any]) -> None:
+        preferred_backend = profile_cfg.get('prefer_attention_backend')
+        if preferred_backend is None:
+            return
+        if os.environ.get('ATTN_BACKEND') or os.environ.get('SPARSE_ATTN_BACKEND'):
+            return
+        from ..modules.attention import config as dense_attn_config
+        from ..modules.sparse import config as sparse_config
+        dense_attn_config.BACKEND = preferred_backend
+        sparse_config.ATTN = preferred_backend
+        print(f"[LOW_VRAM] forcing ATTN_BACKEND={preferred_backend} for profile compatibility")
+
+    def _run_stage(
+        self,
+        stage_name: str,
+        stage_metrics: List[Dict[str, Any]],
+        fn: Callable[[], Any],
+        *,
+        use_autocast: bool = False,
+        autocast_dtype: Optional[torch.dtype] = None,
+        clear_cuda_cache: bool = False,
+    ) -> Any:
+        use_cuda_metrics = self._is_cuda_runtime_active()
+        if use_cuda_metrics:
+            torch.cuda.reset_peak_memory_stats(self.device)
+        start_time = time.perf_counter()
+        context = (
+            torch.autocast(device_type='cuda', dtype=autocast_dtype)
+            if use_autocast and use_cuda_metrics and autocast_dtype is not None
+            else nullcontext()
+        )
+        with context:
+            out = fn()
+        elapsed = time.perf_counter() - start_time
+        metric = {
+            'stage': stage_name,
+            'time_s': elapsed,
+            'peak_vram_allocated_bytes': int(torch.cuda.max_memory_allocated(self.device)) if use_cuda_metrics else None,
+            'peak_vram_reserved_bytes': int(torch.cuda.max_memory_reserved(self.device)) if use_cuda_metrics else None,
+        }
+        stage_metrics.append(metric)
+        if clear_cuda_cache and use_cuda_metrics:
+            torch.cuda.empty_cache()
+        return out
 
     def to(self, device: torch.device) -> None:
         self._device = device
@@ -472,8 +583,10 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         tex_slat_sampler_params: dict = {},
         preprocess_image: bool = True,
         return_latent: bool = False,
+        return_metrics: bool = False,
         pipeline_type: Optional[str] = None,
-        max_num_tokens: int = 49152,
+        max_num_tokens: Optional[int] = None,
+        vram_profile: Optional[str] = None,
     ) -> List[MeshWithVoxel]:
         """
         Run the pipeline.
@@ -487,85 +600,238 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             tex_slat_sampler_params (dict): Additional parameters for the texture SLat sampler.
             preprocess_image (bool): Whether to preprocess the image.
             return_latent (bool): Whether to return the latent codes.
+            return_metrics (bool): Whether to return per-stage timing/VRAM metrics.
             pipeline_type (str): The type of the pipeline. Options: '512', '1024', '1024_cascade', '1536_cascade'.
             max_num_tokens (int): The maximum number of tokens to use.
+            vram_profile (str): Optional VRAM profile preset. Supported: '8gb'.
         """
+        run_start_time = time.perf_counter()
+        profile_name = self._resolve_vram_profile(vram_profile if vram_profile is not None else self.vram_profile)
+        profile_cfg = self.vram_profiles.get(profile_name, {})
+        if profile_cfg:
+            self._configure_attention_backend_for_profile(profile_cfg)
+        effective_pipeline_type = pipeline_type or profile_cfg.get('default_pipeline_type') or self.default_pipeline_type
+        effective_max_num_tokens = max_num_tokens if max_num_tokens is not None else profile_cfg.get('max_num_tokens', 49152)
+        effective_low_vram = bool(self.low_vram or profile_cfg.get('force_low_vram', False))
+        clear_cuda_cache = bool(profile_cfg.get('empty_cache_between_stages', False))
+        autocast_dtype = self._resolve_autocast_dtype(profile_cfg)
+        stage_metrics: List[Dict[str, Any]] = []
+
+        prev_low_vram = self.low_vram
+        self.low_vram = effective_low_vram
         # Check pipeline type
-        pipeline_type = pipeline_type or self.default_pipeline_type
-        if pipeline_type == '512':
+        if effective_pipeline_type == '512':
             assert 'shape_slat_flow_model_512' in self.models, "No 512 resolution shape SLat flow model found."
             assert 'tex_slat_flow_model_512' in self.models, "No 512 resolution texture SLat flow model found."
-        elif pipeline_type == '1024':
+        elif effective_pipeline_type == '1024':
             assert 'shape_slat_flow_model_1024' in self.models, "No 1024 resolution shape SLat flow model found."
             assert 'tex_slat_flow_model_1024' in self.models, "No 1024 resolution texture SLat flow model found."
-        elif pipeline_type == '1024_cascade':
+        elif effective_pipeline_type == '1024_cascade':
             assert 'shape_slat_flow_model_512' in self.models, "No 512 resolution shape SLat flow model found."
             assert 'shape_slat_flow_model_1024' in self.models, "No 1024 resolution shape SLat flow model found."
             assert 'tex_slat_flow_model_1024' in self.models, "No 1024 resolution texture SLat flow model found."
-        elif pipeline_type == '1536_cascade':
+        elif effective_pipeline_type == '1536_cascade':
             assert 'shape_slat_flow_model_512' in self.models, "No 512 resolution shape SLat flow model found."
             assert 'shape_slat_flow_model_1024' in self.models, "No 1024 resolution shape SLat flow model found."
             assert 'tex_slat_flow_model_1024' in self.models, "No 1024 resolution texture SLat flow model found."
         else:
-            raise ValueError(f"Invalid pipeline type: {pipeline_type}")
-        
-        if preprocess_image:
-            image = self.preprocess_image(image)
-        torch.manual_seed(seed)
-        cond_512 = self.get_cond([image], 512)
-        cond_1024 = self.get_cond([image], 1024) if pipeline_type != '512' else None
-        ss_res = {'512': 32, '1024': 64, '1024_cascade': 32, '1536_cascade': 32}[pipeline_type]
-        coords = self.sample_sparse_structure(
-            cond_512, ss_res,
-            num_samples, sparse_structure_sampler_params
-        )
-        if pipeline_type == '512':
-            shape_slat = self.sample_shape_slat(
-                cond_512, self.models['shape_slat_flow_model_512'],
-                coords, shape_slat_sampler_params
+            raise ValueError(f"Invalid pipeline type: {effective_pipeline_type}")
+        try:
+            if preprocess_image:
+                image = self._run_stage(
+                    "preprocess_image",
+                    stage_metrics,
+                    lambda: self.preprocess_image(image),
+                    clear_cuda_cache=clear_cuda_cache,
+                )
+            torch.manual_seed(seed)
+            cond_512 = self._run_stage(
+                "condition_512",
+                stage_metrics,
+                lambda: self.get_cond([image], 512),
+                use_autocast=True,
+                autocast_dtype=autocast_dtype,
+                clear_cuda_cache=clear_cuda_cache,
             )
-            tex_slat = self.sample_tex_slat(
-                cond_512, self.models['tex_slat_flow_model_512'],
-                shape_slat, tex_slat_sampler_params
+            cond_1024 = (
+                self._run_stage(
+                    "condition_1024",
+                    stage_metrics,
+                    lambda: self.get_cond([image], 1024),
+                    use_autocast=True,
+                    autocast_dtype=autocast_dtype,
+                    clear_cuda_cache=clear_cuda_cache,
+                )
+                if effective_pipeline_type != '512'
+                else None
             )
-            res = 512
-        elif pipeline_type == '1024':
-            shape_slat = self.sample_shape_slat(
-                cond_1024, self.models['shape_slat_flow_model_1024'],
-                coords, shape_slat_sampler_params
+            ss_res = {'512': 32, '1024': 64, '1024_cascade': 32, '1536_cascade': 32}[effective_pipeline_type]
+            coords = self._run_stage(
+                "sparse_structure",
+                stage_metrics,
+                lambda: self.sample_sparse_structure(
+                    cond_512,
+                    ss_res,
+                    num_samples,
+                    sparse_structure_sampler_params,
+                ),
+                use_autocast=True,
+                autocast_dtype=autocast_dtype,
+                clear_cuda_cache=clear_cuda_cache,
             )
-            tex_slat = self.sample_tex_slat(
-                cond_1024, self.models['tex_slat_flow_model_1024'],
-                shape_slat, tex_slat_sampler_params
+            if effective_pipeline_type == '512':
+                shape_slat = self._run_stage(
+                    "shape_slat_512",
+                    stage_metrics,
+                    lambda: self.sample_shape_slat(
+                        cond_512,
+                        self.models['shape_slat_flow_model_512'],
+                        coords,
+                        shape_slat_sampler_params,
+                    ),
+                    use_autocast=True,
+                    autocast_dtype=autocast_dtype,
+                    clear_cuda_cache=clear_cuda_cache,
+                )
+                tex_slat = self._run_stage(
+                    "tex_slat_512",
+                    stage_metrics,
+                    lambda: self.sample_tex_slat(
+                        cond_512,
+                        self.models['tex_slat_flow_model_512'],
+                        shape_slat,
+                        tex_slat_sampler_params,
+                    ),
+                    use_autocast=True,
+                    autocast_dtype=autocast_dtype,
+                    clear_cuda_cache=clear_cuda_cache,
+                )
+                res = 512
+            elif effective_pipeline_type == '1024':
+                shape_slat = self._run_stage(
+                    "shape_slat_1024",
+                    stage_metrics,
+                    lambda: self.sample_shape_slat(
+                        cond_1024,
+                        self.models['shape_slat_flow_model_1024'],
+                        coords,
+                        shape_slat_sampler_params,
+                    ),
+                    use_autocast=True,
+                    autocast_dtype=autocast_dtype,
+                    clear_cuda_cache=clear_cuda_cache,
+                )
+                tex_slat = self._run_stage(
+                    "tex_slat_1024",
+                    stage_metrics,
+                    lambda: self.sample_tex_slat(
+                        cond_1024,
+                        self.models['tex_slat_flow_model_1024'],
+                        shape_slat,
+                        tex_slat_sampler_params,
+                    ),
+                    use_autocast=True,
+                    autocast_dtype=autocast_dtype,
+                    clear_cuda_cache=clear_cuda_cache,
+                )
+                res = 1024
+            elif effective_pipeline_type == '1024_cascade':
+                shape_slat, res = self._run_stage(
+                    "shape_slat_1024_cascade",
+                    stage_metrics,
+                    lambda: self.sample_shape_slat_cascade(
+                        cond_512,
+                        cond_1024,
+                        self.models['shape_slat_flow_model_512'],
+                        self.models['shape_slat_flow_model_1024'],
+                        512,
+                        1024,
+                        coords,
+                        shape_slat_sampler_params,
+                        effective_max_num_tokens,
+                    ),
+                    use_autocast=True,
+                    autocast_dtype=autocast_dtype,
+                    clear_cuda_cache=clear_cuda_cache,
+                )
+                tex_slat = self._run_stage(
+                    "tex_slat_1024",
+                    stage_metrics,
+                    lambda: self.sample_tex_slat(
+                        cond_1024,
+                        self.models['tex_slat_flow_model_1024'],
+                        shape_slat,
+                        tex_slat_sampler_params,
+                    ),
+                    use_autocast=True,
+                    autocast_dtype=autocast_dtype,
+                    clear_cuda_cache=clear_cuda_cache,
+                )
+            elif effective_pipeline_type == '1536_cascade':
+                shape_slat, res = self._run_stage(
+                    "shape_slat_1536_cascade",
+                    stage_metrics,
+                    lambda: self.sample_shape_slat_cascade(
+                        cond_512,
+                        cond_1024,
+                        self.models['shape_slat_flow_model_512'],
+                        self.models['shape_slat_flow_model_1024'],
+                        512,
+                        1536,
+                        coords,
+                        shape_slat_sampler_params,
+                        effective_max_num_tokens,
+                    ),
+                    use_autocast=True,
+                    autocast_dtype=autocast_dtype,
+                    clear_cuda_cache=clear_cuda_cache,
+                )
+                tex_slat = self._run_stage(
+                    "tex_slat_1024",
+                    stage_metrics,
+                    lambda: self.sample_tex_slat(
+                        cond_1024,
+                        self.models['tex_slat_flow_model_1024'],
+                        shape_slat,
+                        tex_slat_sampler_params,
+                    ),
+                    use_autocast=True,
+                    autocast_dtype=autocast_dtype,
+                    clear_cuda_cache=clear_cuda_cache,
+                )
+
+            out_mesh = self._run_stage(
+                "decode_latent",
+                stage_metrics,
+                lambda: self.decode_latent(shape_slat, tex_slat, res),
+                clear_cuda_cache=clear_cuda_cache,
             )
-            res = 1024
-        elif pipeline_type == '1024_cascade':
-            shape_slat, res = self.sample_shape_slat_cascade(
-                cond_512, cond_1024,
-                self.models['shape_slat_flow_model_512'], self.models['shape_slat_flow_model_1024'],
-                512, 1024,
-                coords, shape_slat_sampler_params,
-                max_num_tokens
-            )
-            tex_slat = self.sample_tex_slat(
-                cond_1024, self.models['tex_slat_flow_model_1024'],
-                shape_slat, tex_slat_sampler_params
-            )
-        elif pipeline_type == '1536_cascade':
-            shape_slat, res = self.sample_shape_slat_cascade(
-                cond_512, cond_1024,
-                self.models['shape_slat_flow_model_512'], self.models['shape_slat_flow_model_1024'],
-                512, 1536,
-                coords, shape_slat_sampler_params,
-                max_num_tokens
-            )
-            tex_slat = self.sample_tex_slat(
-                cond_1024, self.models['tex_slat_flow_model_1024'],
-                shape_slat, tex_slat_sampler_params
-            )
-        torch.cuda.empty_cache()
-        out_mesh = self.decode_latent(shape_slat, tex_slat, res)
+        finally:
+            self.low_vram = prev_low_vram
+        run_stats = {
+            'vram_profile': profile_name,
+            'device': str(self.device),
+            'low_vram': effective_low_vram,
+            'pipeline_type': effective_pipeline_type,
+            'max_num_tokens': effective_max_num_tokens,
+            'autocast_dtype': self._dtype_name(autocast_dtype),
+            'stage_metrics': stage_metrics,
+            'total_time_s': time.perf_counter() - run_start_time,
+            'peak_vram_allocated_bytes': max(
+                [m['peak_vram_allocated_bytes'] for m in stage_metrics if m['peak_vram_allocated_bytes'] is not None],
+                default=None,
+            ),
+            'peak_vram_reserved_bytes': max(
+                [m['peak_vram_reserved_bytes'] for m in stage_metrics if m['peak_vram_reserved_bytes'] is not None],
+                default=None,
+            ),
+        }
+        self.last_run_stats = run_stats
+
+        if return_latent and return_metrics:
+            return out_mesh, (shape_slat, tex_slat, res), run_stats
         if return_latent:
             return out_mesh, (shape_slat, tex_slat, res)
-        else:
-            return out_mesh
+        if return_metrics:
+            return out_mesh, run_stats
+        return out_mesh
