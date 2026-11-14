@@ -20,14 +20,17 @@ torch::Tensor encode_sparse_voxel_octree_attr_neighbor_cpu(
     const uint32_t res,
     const torch::Tensor& attr
 ) {
-    size_t N = coord.size(0);
-    size_t C = attr.size(1);
+    const int64_t N = coord.size(0);
+    const int64_t C = attr.size(1);
     int* coord_data = coord.data_ptr<int>();
     uint8_t* attr_data = attr.data_ptr<uint8_t>();
-    std::vector<uint8_t> buffer(res * res * res * (C + 1), 0);
+    std::vector<uint8_t> buffer(
+        static_cast<size_t>(res) * static_cast<size_t>(res) * static_cast<size_t>(res) * static_cast<size_t>(C + 1),
+        0
+    );
     
     // Densify the coordinates
-    for (int i = 0; i < N; i++) {
+    for (int64_t i = 0; i < N; i++) {
         int x = coord_data[i * 3 + 0];
         int y = coord_data[i * 3 + 1];
         int z = coord_data[i * 3 + 2];
@@ -79,7 +82,7 @@ torch::Tensor encode_sparse_voxel_octree_attr_neighbor_cpu(
     // Pack the deltas into a uint8 tensor
     torch::Tensor delta = torch::zeros({N, C}, torch::dtype(torch::kUInt8));
     uint8_t* delta_data = delta.data_ptr<uint8_t>();
-    for (int i = 0; i < N; i++) {
+    for (int64_t i = 0; i < N; i++) {
         int x = coord_data[i * 3 + 0];
         int y = coord_data[i * 3 + 1];
         int z = coord_data[i * 3 + 2];
@@ -106,14 +109,17 @@ torch::Tensor decode_sparse_voxel_octree_attr_neighbor_cpu(
     const uint32_t res,
     const torch::Tensor& delta
 ) {
-    size_t N = coord.size(0);
-    size_t C = delta.size(1);
+    const int64_t N = coord.size(0);
+    const int64_t C = delta.size(1);
     int* coord_data = coord.data_ptr<int>();
     uint8_t* delta_data = delta.data_ptr<uint8_t>();
-    std::vector<uint8_t> buffer(res * res * res * (C + 1), 0);
+    std::vector<uint8_t> buffer(
+        static_cast<size_t>(res) * static_cast<size_t>(res) * static_cast<size_t>(res) * static_cast<size_t>(C + 1),
+        0
+    );
     
     // Densify the coordinates
-    for (int i = 0; i < N; i++) {
+    for (int64_t i = 0; i < N; i++) {
         int x = coord_data[i * 3 + 0];
         int y = coord_data[i * 3 + 1];
         int z = coord_data[i * 3 + 2];
@@ -165,7 +171,7 @@ torch::Tensor decode_sparse_voxel_octree_attr_neighbor_cpu(
     // Pack the attribute into a uint8 tensor
     torch::Tensor attr = torch::zeros({N, C}, torch::dtype(torch::kUInt8));
     uint8_t* attr_data = attr.data_ptr<uint8_t>();
-    for (int i = 0; i < N; i++) {
+    for (int64_t i = 0; i < N; i++) {
         int x = coord_data[i * 3 + 0];
         int y = coord_data[i * 3 + 1];
         int z = coord_data[i * 3 + 2];

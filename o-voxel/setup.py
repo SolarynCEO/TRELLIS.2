@@ -1,9 +1,13 @@
 from setuptools import setup
 from torch.utils.cpp_extension import CUDAExtension, BuildExtension, IS_HIP_EXTENSION
 import os
+import platform
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
+IS_WINDOWS = platform.system() == "Windows"
+EIGEN_INCLUDE_DIR = os.path.join(ROOT, "third_party", "eigen")
+EIGEN_DENSE_HEADER = os.path.join(EIGEN_INCLUDE_DIR, "Eigen", "Dense")
 
 if BUILD_TARGET == "auto":
     if IS_HIP_EXTENSION:
@@ -15,12 +19,39 @@ else:
         IS_HIP = False
     elif BUILD_TARGET == "rocm":
         IS_HIP = True
+    else:
+        raise ValueError(f"Invalid BUILD_TARGET={BUILD_TARGET}")
 
-if not IS_HIP:
-    cc_flag = []
-else:
+if not os.path.isfile(EIGEN_DENSE_HEADER):
+    raise RuntimeError(
+        "Missing Eigen headers at o-voxel/third_party/eigen. "
+        "Initialize submodules before building: "
+        "git submodule update --init --recursive"
+    )
+
+if IS_HIP:
     archs = os.getenv("GPU_ARCHS", "native").split(";")
-    cc_flag = [f"--offload-arch={arch}" for arch in archs]
+    nvcc_flags = [f"--offload-arch={arch}" for arch in archs]
+else:
+    nvcc_flags = []
+
+if IS_WINDOWS:
+    cxx_flags = ["/O2", "/std:c++17", "/EHsc", "/permissive-", "/Zc:__cplusplus"]
+    nvcc_flags = [
+        "-O3",
+        "-std=c++17",
+        "--expt-relaxed-constexpr",
+        "--extended-lambda",
+        "-Xcompiler=/std:c++17",
+        "-Xcompiler=/EHsc",
+        "-Xcompiler=/permissive-",
+        "-Xcompiler=/Zc:__cplusplus",
+    ] + nvcc_flags
+    if not IS_HIP:
+        nvcc_flags += ["-allow-unsupported-compiler"]
+else:
+    cxx_flags = ["-O3", "-std=c++17"]
+    nvcc_flags = ["-O3", "-std=c++17"] + nvcc_flags
 
 setup(
     name="o_voxel",
@@ -53,11 +84,11 @@ setup(
                 "src/ext.cpp",
             ],
             include_dirs=[
-                os.path.join(ROOT, "third_party/eigen"),
+                EIGEN_INCLUDE_DIR,
             ],
             extra_compile_args={
-                "cxx": ["-O3", "-std=c++17"],
-                "nvcc": ["-O3","-std=c++17"] + cc_flag,
+                "cxx": cxx_flags,
+                "nvcc": nvcc_flags,
             }
         )
     ],

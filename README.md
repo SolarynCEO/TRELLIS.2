@@ -57,6 +57,7 @@ Data processing is streamlined for instant conversions that are fully **renderin
 
 ### Prerequisites
 - **System**: The code is currently tested only on **Linux**.
+- **Windows note**: Native extension build instructions for MSVC/CUDA are documented in [`docs/zyrex/WINDOWS_BUILD.md`](docs/zyrex/WINDOWS_BUILD.md).
 - **Hardware**: An NVIDIA GPU with at least 24GB of memory is necessary. The code has been verified on NVIDIA A100 and H100 GPUs.  
 - **Software**:   
   - The [CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit-archive) is needed to compile certain packages. Recommended version is 12.4.  
