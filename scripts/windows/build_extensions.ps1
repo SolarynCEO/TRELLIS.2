@@ -2,14 +2,13 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$PythonExe,
-    [string]$VcVarsPath = "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat",
+    [string]$VcVarsPath = "",
     [string]$CudaHome = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4",
     [string]$TorchCudaArchList = "",
     [string]$ExtensionRoot = ""
 )
 
 $ErrorActionPreference = "Stop"
-$PSNativeCommandUseErrorActionPreference = $true
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = (Resolve-Path (Join-Path $scriptDir "..\..")).Path
@@ -27,10 +26,6 @@ if (-not (Test-Path -LiteralPath $PythonExe)) {
     throw "Python executable not found: $PythonExe"
 }
 $PythonExe = (Resolve-Path -LiteralPath $PythonExe).Path
-
-if (-not (Test-Path -LiteralPath $VcVarsPath)) {
-    throw "vcvars64.bat not found at '$VcVarsPath'. Install VS 2022 Build Tools and/or override -VcVarsPath."
-}
 
 if (-not (Test-Path -LiteralPath $CudaHome)) {
     throw "CUDA_HOME path not found: '$CudaHome'. Install CUDA 12.4 or override -CudaHome."
@@ -52,6 +47,55 @@ $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $logDir = Join-Path $repoRoot "build-logs/windows-extensions-$timestamp"
 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 
+function Resolve-VcVarsPath {
+    param([string]$RequestedPath)
+
+    if (-not [string]::IsNullOrWhiteSpace($RequestedPath)) {
+        if (-not (Test-Path -LiteralPath $RequestedPath)) {
+            throw "vcvars64.bat not found at '$RequestedPath'."
+        }
+        return (Resolve-Path -LiteralPath $RequestedPath).Path
+    }
+
+    $vswhereCandidates = @()
+    if ($env:ProgramFiles -and -not [string]::IsNullOrWhiteSpace($env:ProgramFiles)) {
+        $vswhereCandidates += (Join-Path $env:ProgramFiles "Microsoft Visual Studio\Installer\vswhere.exe")
+    }
+    if ($env:ProgramFiles -and $env:ProgramFiles.Contains(" (x86)")) {
+        $vswhereCandidates += (Join-Path $env:ProgramFiles.Replace(" (x86)", "") "Microsoft Visual Studio\Installer\vswhere.exe")
+    } elseif ($env:ProgramFiles) {
+        $vswhereCandidates += (Join-Path "$env:SystemDrive\Program Files (x86)" "Microsoft Visual Studio\Installer\vswhere.exe")
+    }
+    $vswhereCandidates = $vswhereCandidates | Select-Object -Unique
+
+    foreach ($vswherePath in $vswhereCandidates) {
+        if (-not (Test-Path -LiteralPath $vswherePath)) {
+            continue
+        }
+        $resolved = & $vswherePath -products * -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find "VC\Auxiliary\Build\vcvars64.bat" 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            foreach ($line in $resolved) {
+                $candidate = $line.Trim()
+                if (-not [string]::IsNullOrWhiteSpace($candidate) -and (Test-Path -LiteralPath $candidate)) {
+                    return $candidate
+                }
+            }
+        }
+    }
+
+    $fallbackCandidates = @(
+        "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat",
+        "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+    )
+    foreach ($candidate in $fallbackCandidates) {
+        if (Test-Path -LiteralPath $candidate) {
+            return $candidate
+        }
+    }
+
+    throw "Could not auto-detect vcvars64.bat. Install VS 2022 Build Tools (Desktop development with C++) or pass -VcVarsPath explicitly."
+}
+
 function Invoke-LoggedExternal {
     param(
         [Parameter(Mandatory = $true)][string]$StepName,
@@ -62,14 +106,45 @@ function Invoke-LoggedExternal {
 
     $logFile = Join-Path $logDir "$StepName.log"
     Write-Host "[$StepName] $FilePath $($Arguments -join ' ')"
-    Push-Location $WorkingDirectory
-    try {
-        & $FilePath @Arguments *>&1 | Tee-Object -FilePath $logFile
-        if ($LASTEXITCODE -ne 0) {
-            throw "Step '$StepName' failed with exit code $LASTEXITCODE. See: $logFile"
-        }
-    } finally {
-        Pop-Location
+    $stdoutLog = Join-Path $logDir "$StepName.stdout.log"
+    $stderrLog = Join-Path $logDir "$StepName.stderr.log"
+    if (Test-Path -LiteralPath $stdoutLog) { Remove-Item -LiteralPath $stdoutLog -Force }
+    if (Test-Path -LiteralPath $stderrLog) { Remove-Item -LiteralPath $stderrLog -Force }
+
+    $process = Start-Process `
+        -FilePath $FilePath `
+        -ArgumentList $Arguments `
+        -WorkingDirectory $WorkingDirectory `
+        -NoNewWindow `
+        -PassThru `
+        -Wait `
+        -RedirectStandardOutput $stdoutLog `
+        -RedirectStandardError $stderrLog
+
+    $stdoutText = if (Test-Path -LiteralPath $stdoutLog) { Get-Content -LiteralPath $stdoutLog -Raw } else { "" }
+    $stderrText = if (Test-Path -LiteralPath $stderrLog) { Get-Content -LiteralPath $stderrLog -Raw } else { "" }
+
+    if (-not [string]::IsNullOrEmpty($stdoutText)) {
+        Write-Host $stdoutText -NoNewline
+    }
+    if (-not [string]::IsNullOrEmpty($stderrText)) {
+        Write-Host $stderrText -NoNewline
+    }
+
+    $commandLine = "$FilePath $($Arguments -join ' ')"
+    Set-Content -LiteralPath $logFile -Value @(
+        "Command: $commandLine",
+        "",
+        "=== STDOUT ===",
+        $stdoutText,
+        "",
+        "=== STDERR ===",
+        $stderrText
+    )
+
+    $global:LASTEXITCODE = $process.ExitCode
+    if ($process.ExitCode -ne 0) {
+        throw "Step '$StepName' failed with exit code $($process.ExitCode). See: $logFile"
     }
 }
 
@@ -101,13 +176,15 @@ function Clone-AtCommit {
         Remove-Item -Recurse -Force $targetDir
     }
 
-    Invoke-LoggedExternal -StepName "$Name-clone" -WorkingDirectory $ExtensionRoot -FilePath "git" -Arguments @("clone", $RepoUrl, $targetDir)
+    Invoke-LoggedExternal -StepName "$Name-clone" -WorkingDirectory $ExtensionRoot -FilePath "git" -Arguments @("clone", "--quiet", $RepoUrl, $targetDir)
     Invoke-LoggedExternal -StepName "$Name-checkout" -WorkingDirectory $targetDir -FilePath "git" -Arguments @("checkout", $Commit)
     Invoke-LoggedExternal -StepName "$Name-submodules" -WorkingDirectory $targetDir -FilePath "git" -Arguments @("submodule", "update", "--init", "--recursive")
     return $targetDir
 }
 
 Write-Host "Initializing VS/MSVC build environment..."
+$VcVarsPath = Resolve-VcVarsPath -RequestedPath $VcVarsPath
+Write-Host "Using vcvars64: $VcVarsPath"
 Import-VcVarsEnvironment -VcVarsBatPath $VcVarsPath
 
 $env:CUDA_HOME = $CudaHome
@@ -135,7 +212,8 @@ $flexGemmDir = Clone-AtCommit -Name "FlexGEMM" -RepoUrl $flexGemmRepo -Commit $f
 
 Invoke-LoggedExternal -StepName "nvdiffrast-build" -WorkingDirectory $repoRoot -FilePath $PythonExe -Arguments @("-m", "pip", "install", $nvdiffrastDir, "--no-build-isolation")
 Invoke-LoggedExternal -StepName "cumesh-build" -WorkingDirectory $repoRoot -FilePath $PythonExe -Arguments @("-m", "pip", "install", $cuMeshDir, "--no-build-isolation")
-Invoke-LoggedExternal -StepName "triton-windows-install" -WorkingDirectory $repoRoot -FilePath $PythonExe -Arguments @("-m", "pip", "install", "--upgrade", "triton-windows")
+# Torch 2.6.x is compatible with Triton 3.2.x on Windows.
+Invoke-LoggedExternal -StepName "triton-windows-install" -WorkingDirectory $repoRoot -FilePath $PythonExe -Arguments @("-m", "pip", "install", "--upgrade", "triton-windows<3.3")
 Invoke-LoggedExternal -StepName "flexgemm-patch" -WorkingDirectory $flexGemmDir -FilePath "git" -Arguments @("apply", "--whitespace=nowarn", $patchFile)
 Invoke-LoggedExternal -StepName "flexgemm-build" -WorkingDirectory $repoRoot -FilePath $PythonExe -Arguments @("-m", "pip", "install", $flexGemmDir, "--no-build-isolation")
 Invoke-LoggedExternal -StepName "o-voxel-build" -WorkingDirectory $repoRoot -FilePath $PythonExe -Arguments @("-m", "pip", "install", (Join-Path $repoRoot "o-voxel"), "--no-build-isolation", "--no-deps")

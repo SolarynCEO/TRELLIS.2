@@ -30,7 +30,9 @@ It builds:
 
 FlexGEMM uses Triton kernels. On Windows, install `triton-windows`.
 
-- The script installs/updates `triton-windows` automatically before FlexGEMM build.
+- For `torch==2.6.0+cu124`, pin Triton to 3.2.x:
+  - `triton-windows<3.3`
+- The script installs/updates this pinned range automatically before FlexGEMM build.
 - PyPI metadata currently reports `triton-windows` license as `MIT` (permissive).
 
 ## Usage
@@ -46,24 +48,30 @@ Optional overrides:
 ```powershell
 .\scripts\windows\build_extensions.ps1 `
   -PythonExe C:\path\to\venv\Scripts\python.exe `
-  -VcVarsPath "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" `
+  -VcVarsPath "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" `
   -CudaHome "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4" `
   -TorchCudaArchList "8.9"
 ```
 
 ## What the script does
 
-1. Imports MSVC environment from `vcvars64.bat`.
-2. Sets:
+1. Finds `vcvars64.bat` in this order:
+   - explicit `-VcVarsPath` (if provided)
+   - `vswhere.exe` (`-products *`) auto-detection
+   - fallback paths under both `Program Files (x86)` and `Program Files`
+2. Imports MSVC environment from `vcvars64.bat`.
+3. Sets:
    - `CUDA_HOME` / `CUDA_PATH`
    - `TORCH_CUDA_ARCH_LIST` (defaults to `8.9`, overridable)
    - `DISTUTILS_USE_SDK=1`
-3. Runs `git submodule update --init --recursive` in this repo.
-4. Verifies `o-voxel/third_party/eigen/Eigen/Dense` exists.
-5. Clones external extension repos at pinned commits.
-6. Applies `patches/flexgemm-windows-msvc.patch`.
-7. Builds each extension with `pip install --no-build-isolation`.
-8. Writes per-step logs under `build-logs/windows-extensions-<timestamp>/`.
+4. Runs `git submodule update --init --recursive` in this repo.
+5. Verifies `o-voxel/third_party/eigen/Eigen/Dense` exists.
+6. Clones external extension repos at pinned commits.
+7. Applies `patches/flexgemm-windows-msvc.patch`.
+8. Builds each extension with `pip install --no-build-isolation`.
+9. Writes per-step logs under `build-logs/windows-extensions-<timestamp>/`.
+
+Implementation note: native command execution is based on `Start-Process` with redirected stdout/stderr and exit-code checks, so stderr output (for example Git progress lines) does not fail the run in Windows PowerShell 5.1.
 
 ## Troubleshooting
 
@@ -80,7 +88,7 @@ If you are using a shallow/partial clone, ensure submodules are allowed and reac
 ### MSVC or CUDA not found
 
 - Verify Build Tools 2022 are installed.
-- Verify the `vcvars64.bat` path.
+- If auto-detection misses your install, pass `-VcVarsPath` explicitly.
 - Verify `CUDA_HOME` points to CUDA 12.4.
 
 ### Wrong GPU arch
@@ -92,3 +100,18 @@ $env:TORCH_CUDA_ARCH_LIST = "8.9"
 ```
 
 or pass `-TorchCudaArchList` to the script.
+
+## Real hardware validation notes (reported from Windows laptop)
+
+Environment:
+
+- Windows PowerShell 5.1
+- VS 2022 Build Tools
+- CUDA 12.4
+- `torch==2.6.0+cu124`
+- RTX 4070 Laptop (`sm_89`)
+
+Reported outcome after these script/path/patch fixes:
+
+- `nvdiffrast`, `CuMesh`, `FlexGEMM` (with this repo patch), and `o-voxel` build and import successfully.
+- Repo test suite passes (`8` pytest tests).
