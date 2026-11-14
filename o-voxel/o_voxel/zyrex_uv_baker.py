@@ -327,14 +327,10 @@ if _TRITON_AVAILABLE:
         x0 = min_x + tile_x * TILE_W
         y0 = min_y + tile_y * TILE_H
 
-        xs = x0 + tl.arange(0, TILE_W)
-        ys = y0 + tl.arange(0, TILE_H)
-        x = tl.broadcast_to(xs[None, :], [TILE_H, TILE_W])
-        y = tl.broadcast_to(ys[:, None], [TILE_H, TILE_W])
+        x = x0 + tl.arange(0, TILE_W)[None, :]
+        y = y0 + tl.arange(0, TILE_H)[:, None]
 
         valid = (x <= max_x) & (y <= max_y) & (x >= 0) & (y >= 0) & (x < width) & (y < height)
-        if not tl.any(valid):
-            return
 
         xfp = x.to(tl.int64) * subpixel_scale
         yfp = y.to(tl.int64) * subpixel_scale
@@ -345,9 +341,9 @@ if _TRITON_AVAILABLE:
         v1y = tl.load(v1y_ptr + face_local)
         v2x = tl.load(v2x_ptr + face_local)
         v2y = tl.load(v2y_ptr + face_local)
-        include_e0 = tl.load(include_e0_ptr + face_local).to(tl.int1)
-        include_e1 = tl.load(include_e1_ptr + face_local).to(tl.int1)
-        include_e2 = tl.load(include_e2_ptr + face_local).to(tl.int1)
+        include_e0 = tl.load(include_e0_ptr + face_local) != 0
+        include_e1 = tl.load(include_e1_ptr + face_local) != 0
+        include_e2 = tl.load(include_e2_ptr + face_local) != 0
 
         e0 = (xfp - v1x) * (v2y - v1y) - (yfp - v1y) * (v2x - v1x)
         e1 = (xfp - v2x) * (v0y - v2y) - (yfp - v2y) * (v0x - v2x)
@@ -357,8 +353,6 @@ if _TRITON_AVAILABLE:
         in1 = (e1 < 0) | ((e1 == 0) & include_e1)
         in2 = (e2 < 0) | ((e2 == 0) & include_e2)
         inside = valid & in0 & in1 & in2
-        if not tl.any(inside):
-            return
 
         pix = y * width + x
         tl.atomic_min(out_face_ptr + pix, face_global, mask=inside)
