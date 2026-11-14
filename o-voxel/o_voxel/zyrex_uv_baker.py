@@ -120,20 +120,41 @@ def rasterize_uv_triangles(
         y = y_int.to(torch.float32) + 0.5
 
         tri = tri_valid[compact_rep]
-        ax = tri[:, 0, 0]
-        ay = tri[:, 0, 1]
-        bx = tri[:, 1, 0]
-        by = tri[:, 1, 1]
-        cx = tri[:, 2, 0]
-        cy = tri[:, 2, 1]
-        denom = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
-        nondegenerate = torch.abs(denom) >= eps
-        safe_denom = torch.where(nondegenerate, denom, torch.ones_like(denom))
-        w0 = ((by - cy) * (x - cx) + (cx - bx) * (y - cy)) / safe_denom
-        w1 = ((cy - ay) * (x - cx) + (ax - cx) * (y - cy)) / safe_denom
-        w2 = 1.0 - w0 - w1
+        v0 = tri[:, 0]
+        v1 = tri[:, 1]
+        v2 = tri[:, 2]
+        area = (v1[:, 0] - v0[:, 0]) * (v2[:, 1] - v0[:, 1]) - (v1[:, 1] - v0[:, 1]) * (v2[:, 0] - v0[:, 0])
+        swap = area < 0
+        if swap.any():
+            v1_swapped = torch.where(swap[:, None], v2, v1)
+            v2_swapped = torch.where(swap[:, None], v1, v2)
+            v1 = v1_swapped
+            v2 = v2_swapped
+            area = torch.abs(area)
+        nondegenerate = area >= eps
+        safe_area = torch.where(nondegenerate, area, torch.ones_like(area))
 
-        inside = nondegenerate & (w0 >= -eps) & (w1 >= -eps) & (w2 >= -eps)
+        # Edge functions for top-left rule.
+        e0 = (x - v1[:, 0]) * (v2[:, 1] - v1[:, 1]) - (y - v1[:, 1]) * (v2[:, 0] - v1[:, 0])
+        e1 = (x - v2[:, 0]) * (v0[:, 1] - v2[:, 1]) - (y - v2[:, 1]) * (v0[:, 0] - v2[:, 0])
+        e2 = (x - v0[:, 0]) * (v1[:, 1] - v0[:, 1]) - (y - v0[:, 1]) * (v1[:, 0] - v0[:, 0])
+
+        # Screen-space top-left convention in y-down image coordinates.
+        def edge_top_left(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            dx = b[:, 0] - a[:, 0]
+            dy = b[:, 1] - a[:, 1]
+            return (dy < 0) | ((dy == 0) & (dx > 0))
+
+        tl0 = edge_top_left(v1, v2)
+        tl1 = edge_top_left(v2, v0)
+        tl2 = edge_top_left(v0, v1)
+
+        inside = (
+            nondegenerate
+            & ((e0 < 0) | ((torch.abs(e0) <= eps) & tl0))
+            & ((e1 < 0) | ((torch.abs(e1) <= eps) & tl1))
+            & ((e2 < 0) | ((torch.abs(e2) <= eps) & tl2))
+        )
         if not inside.any():
             start = tentative_end
             continue
@@ -141,6 +162,9 @@ def rasterize_uv_triangles(
         compact_rep = compact_rep[inside]
         pix_idx = y_int[inside] * width + x_int[inside]
         face_idx = (start + local_face_ids[compact_rep]).long()
+        w0 = -e0 / safe_area
+        w1 = -e1 / safe_area
+        w2 = -e2 / safe_area
         bary = torch.stack([w0[inside], w1[inside], w2[inside]], dim=-1).to(dtype=dtype)
 
         unique_pix, inv = torch.unique(pix_idx, sorted=False, return_inverse=True)
@@ -351,6 +375,7 @@ def bake_tangent_space_normal_map(
     uvs: torch.Tensor,
     vertex_normals: torch.Tensor,
     raster: UVRasterization,
+    detail_vertex_normals: Optional[torch.Tensor] = None,
     eps: float = 1e-8,
 ) -> torch.Tensor:
     normal_map = torch.zeros((*raster.mask.shape, 3), dtype=vertices.dtype, device=vertices.device)
@@ -379,15 +404,21 @@ def bake_tangent_space_normal_map(
     interp_normals = interpolate_vertex_attributes(vertex_normals, faces, raster)
     n = F.normalize(interp_normals[raster.mask], dim=-1)
     face_ids = raster.face_indices[raster.mask]
+    if detail_vertex_normals is not None:
+        detail_interp = interpolate_vertex_attributes(detail_vertex_normals, faces, raster)
+        detail_n = F.normalize(detail_interp[raster.mask], dim=-1)
+    else:
+        face_geo_normals = F.normalize(torch.cross(e1, e2, dim=-1), dim=-1)
+        detail_n = face_geo_normals[face_ids]
     t = F.normalize(tangent[face_ids], dim=-1)
     t = F.normalize(t - (t * n).sum(dim=-1, keepdim=True) * n, dim=-1)
     b = F.normalize(torch.cross(n, t, dim=-1), dim=-1)
 
     normal_ts = torch.stack(
         [
-            (n * t).sum(dim=-1),
-            (n * b).sum(dim=-1),
-            (n * n).sum(dim=-1),
+            (detail_n * t).sum(dim=-1),
+            (detail_n * b).sum(dim=-1),
+            (detail_n * n).sum(dim=-1),
         ],
         dim=-1,
     )

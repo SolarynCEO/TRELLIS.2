@@ -87,6 +87,49 @@ Expected outputs:
   - metallic/roughness
   - normal maps
 
+### Produce real pipeline voxel-volume input (for production-path baker comparison)
+
+From repo root in PowerShell:
+
+```powershell
+$env:ZYREX_LOW_VRAM = "1"
+
+py -3 scripts\benchmark_low_vram.py `
+  --image "C:\path\to\input.png" `
+  --vram-profile 8gb `
+  --pipeline-type 512 `
+  --max-num-tokens 32768 `
+  --texture-size 2048 `
+  --output-dir "outputs\benchmarks" `
+  --dump-baker-input
+```
+
+This writes an `.npz` baker-input dump path in the benchmark JSON under
+`settings.baker_input_dump_path`.
+
+### Compare nvdiffrast vs zyrex using production to_glb inputs
+
+```powershell
+$env:ZYREX_LOW_VRAM = "1"
+
+py -3 trellis2\utils\zyrex_baker_compare.py `
+  --output "outputs\benchmarks\zyrex_gpu_compare_voxel_2048.json" `
+  --voxel-input "outputs\benchmarks\low_vram_baker_input_YYYYMMDDTHHMMSSZ.npz" `
+  --run-gpu `
+  --texture-size 2048 `
+  --synthetic-texture-size 128 `
+  --skip-rendered-views `
+  --gpu-artifacts-dir "outputs\benchmarks\zyrex_gpu_compare_voxel_2048_artifacts"
+```
+
+The JSON includes:
+
+- timing + peak VRAM allocated/reserved for both bakers
+- seam coverage (nvd, zyrex, overlap, xor)
+- map metrics vs nvdiffrast on **shared covered mask** and **full texture**
+- per-channel MAE/RMSE
+- side-by-side PNG outputs
+
 ### Synthetic rasterizer timing proxy (no GPU required)
 
 If you only need a rough throughput check of the rasterizer path, run:

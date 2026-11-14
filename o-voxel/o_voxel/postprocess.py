@@ -58,6 +58,7 @@ def to_glb(
     mesh_cluster_smooth_strength=1,
     verbose: bool = False,
     use_tqdm: bool = False,
+    return_debug: bool = False,
 ):
     """
     Convert an extracted mesh to a GLB file.
@@ -265,6 +266,11 @@ def to_glb(
         )
 
     normal_map = None
+    mask = None
+    base_color = None
+    metallic = None
+    roughness = None
+    alpha = None
     if backend == "zyrex":
         from .zyrex_uv_baker import bake_voxel_pbr_maps
 
@@ -293,7 +299,7 @@ def to_glb(
             voxel_size=voxel_size,
             grid_size=grid_size,
             texture_size=texture_size,
-            seam_padding_iterations=8,
+            seam_padding_iterations=0,
             position_mapper=map_to_original_surface,
             sample_chunk_size=_resolve_zyrex_sample_chunk_size(),
         )
@@ -347,11 +353,6 @@ def to_glb(
         metallic = np.clip(attrs[..., attr_layout['metallic']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
         roughness = np.clip(attrs[..., attr_layout['roughness']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
         alpha = np.clip(attrs[..., attr_layout['alpha']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
-        mask_inv = (~mask).astype(np.uint8)
-        base_color = cv2.inpaint(base_color, mask_inv, 3, cv2.INPAINT_TELEA)
-        metallic = cv2.inpaint(metallic, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
-        roughness = cv2.inpaint(roughness, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
-        alpha = cv2.inpaint(alpha, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
     if use_tqdm:
         pbar.update(1)
     if verbose:
@@ -364,6 +365,21 @@ def to_glb(
         print("Finalizing mesh...", end='', flush=True)
     
     alpha_mode = 'OPAQUE'
+    mask_raw = mask.copy()
+    base_color_raw = base_color.copy()
+    metallic_raw = metallic.copy()
+    roughness_raw = roughness.copy()
+    alpha_raw = alpha.copy()
+    normal_raw = normal_map.copy() if normal_map is not None else None
+
+    # Keep seam fill behavior equivalent to production nvdiffrast path.
+    mask_inv = (~mask).astype(np.uint8)
+    base_color = cv2.inpaint(base_color, mask_inv, 3, cv2.INPAINT_TELEA)
+    metallic = cv2.inpaint(metallic, mask_inv, 1, cv2.INPAINT_TELEA)
+    roughness = cv2.inpaint(roughness, mask_inv, 1, cv2.INPAINT_TELEA)
+    alpha = cv2.inpaint(alpha, mask_inv, 1, cv2.INPAINT_TELEA)
+    if normal_map is not None:
+        normal_map = cv2.inpaint(normal_map, mask_inv, 3, cv2.INPAINT_TELEA)
 
     if metallic.ndim == 2:
         metallic = metallic[..., None]
@@ -410,5 +426,25 @@ def to_glb(
         pbar.close()
     if verbose:
         print("Done")
-    
-    return textured_mesh
+
+    if not return_debug:
+        return textured_mesh
+    debug = {
+        "backend": backend,
+        "mask_raw": mask_raw,
+        "maps_raw": {
+            "base_color": base_color_raw,
+            "metallic": metallic_raw,
+            "roughness": roughness_raw,
+            "alpha": alpha_raw,
+            "normal": normal_raw,
+        },
+        "maps_filled": {
+            "base_color": base_color,
+            "metallic": metallic,
+            "roughness": roughness,
+            "alpha": alpha,
+            "normal": normal_map,
+        },
+    }
+    return textured_mesh, debug

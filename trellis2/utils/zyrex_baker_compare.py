@@ -4,6 +4,7 @@ import argparse
 import importlib.util
 import json
 import math
+import os
 import platform
 import sys
 import time
@@ -372,6 +373,27 @@ def _save_side_by_side_png(reference: np.ndarray, candidate: np.ndarray, out_pat
     Image.fromarray(panel).save(out_path)
 
 
+def _load_voxel_input(npz_path: Path) -> Dict[str, object]:
+    data = np.load(npz_path, allow_pickle=True)
+    layout_json = str(data["attr_layout_json"][0])
+    layout_obj = json.loads(layout_json)
+    attr_layout = {k: slice(int(v[0]), int(v[1])) for k, v in layout_obj.items()}
+    to_glb_args = {}
+    if "to_glb_args_json" in data:
+        to_glb_args = json.loads(str(data["to_glb_args_json"][0]))
+    return {
+        "vertices": torch.from_numpy(data["vertices"]).float(),
+        "faces": torch.from_numpy(data["faces"]).long(),
+        "attrs": torch.from_numpy(data["attrs"]).float(),
+        "coords": torch.from_numpy(data["coords"]).int(),
+        "aabb": torch.from_numpy(data["aabb"]).float(),
+        "grid_size": torch.from_numpy(data["grid_size"]).int(),
+        "voxel_size": torch.from_numpy(data["voxel_size"]).float(),
+        "attr_layout": attr_layout,
+        "to_glb_args": to_glb_args,
+    }
+
+
 def _rotation_matrix(yaw_deg: float, pitch_deg: float) -> np.ndarray:
     yaw = math.radians(yaw_deg)
     pitch = math.radians(pitch_deg)
@@ -690,6 +712,7 @@ def run_gpu_comparison_real_asset(
     zyx_mask = zyx["mask"].detach().cpu().numpy().astype(bool)
     union_mask = nvd_mask | zyx_mask
     overlap_mask = nvd_mask & zyx_mask
+    full_mask = np.ones_like(union_mask, dtype=bool)
 
     nvd_base = nvd["base_color"].detach().cpu().numpy()
     nvd_mr = nvd["metallic_roughness"].detach().cpu().numpy()
@@ -708,6 +731,18 @@ def run_gpu_comparison_real_asset(
     _save_side_by_side_png(nvd_mr, zyx_mr, png_paths["metallic_roughness"])
     _save_side_by_side_png(nvd_normal, zyx_normal, png_paths["normal"])
     _progress("gpu_real_asset: side-by-side PNGs written", started)
+
+    def map_metric_pack(pred: np.ndarray, ref: np.ndarray) -> Dict[str, object]:
+        return {
+            "shared_covered": {
+                **masked_metrics(pred, ref, overlap_mask),
+                **_per_channel_error(pred, ref, overlap_mask),
+            },
+            "full_texture": {
+                **masked_metrics(pred, ref, full_mask),
+                **_per_channel_error(pred, ref, full_mask),
+            },
+        }
 
     return {
         "status": "measured",
@@ -730,18 +765,152 @@ def run_gpu_comparison_real_asset(
             "xor_ratio": float(np.logical_xor(nvd_mask, zyx_mask).mean()),
         },
         "map_metrics_vs_nvdiffrast": {
-            "base_color": {
-                **masked_metrics(zyx_base, nvd_base, union_mask),
-                **_per_channel_error(zyx_base, nvd_base, union_mask),
+            "base_color": map_metric_pack(zyx_base, nvd_base),
+            "metallic_roughness": map_metric_pack(zyx_mr, nvd_mr),
+            "normal": map_metric_pack(zyx_normal, nvd_normal),
+        },
+        "side_by_side_pngs": {k: str(v.resolve()) for k, v in png_paths.items()},
+    }
+
+
+def run_gpu_comparison_voxel_input(
+    voxel_input_path: Path,
+    output_dir: Path,
+) -> Dict[str, object]:
+    started = time.perf_counter()
+    if not torch.cuda.is_available():
+        return {
+            "status": "pending GPU run",
+            "reason": "CUDA is required for --run-gpu voxel-input comparison.",
+        }
+    try:
+        import nvdiffrast.torch as _  # noqa: F401
+    except Exception:
+        return {
+            "status": "pending GPU run",
+            "reason": "nvdiffrast is required for --run-gpu voxel-input comparison.",
+        }
+
+    _progress("gpu_voxel: loading voxel input", started)
+    voxel = _load_voxel_input(voxel_input_path)
+    import o_voxel
+
+    args = {
+        "vertices": voxel["vertices"].cuda(),
+        "faces": voxel["faces"].cuda(),
+        "attr_volume": voxel["attrs"].cuda(),
+        "coords": voxel["coords"].cuda(),
+        "attr_layout": voxel["attr_layout"],
+        "aabb": voxel["aabb"].cuda(),
+        "grid_size": voxel["grid_size"].cuda(),
+    }
+    args.update(voxel["to_glb_args"])
+    args.setdefault("decimation_target", 500000)
+    args.setdefault("texture_size", 2048)
+    args.setdefault("remesh", True)
+    args.setdefault("remesh_band", 1)
+    args.setdefault("remesh_project", 0)
+    args.setdefault("use_tqdm", False)
+
+    old_backend = os.environ.get("ZYREX_BAKER")
+    try:
+        os.environ["ZYREX_BAKER"] = "nvdiffrast"
+        _progress("gpu_voxel: nvdiffrast to_glb start", started)
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        t0 = time.perf_counter()
+        _, nvd_dbg = o_voxel.postprocess.to_glb(return_debug=True, **args)
+        torch.cuda.synchronize()
+        nvd_time = time.perf_counter() - t0
+        nvd_alloc_mb = torch.cuda.max_memory_allocated() / (1024**2)
+        nvd_reserved_mb = torch.cuda.max_memory_reserved() / (1024**2)
+
+        os.environ["ZYREX_BAKER"] = "zyrex"
+        _progress("gpu_voxel: zyrex to_glb start", started)
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        t1 = time.perf_counter()
+        _, zyx_dbg = o_voxel.postprocess.to_glb(return_debug=True, **args)
+        torch.cuda.synchronize()
+        zyx_time = time.perf_counter() - t1
+        zyx_alloc_mb = torch.cuda.max_memory_allocated() / (1024**2)
+        zyx_reserved_mb = torch.cuda.max_memory_reserved() / (1024**2)
+    finally:
+        if old_backend is None:
+            os.environ.pop("ZYREX_BAKER", None)
+        else:
+            os.environ["ZYREX_BAKER"] = old_backend
+
+    nvd_mask = np.array(nvd_dbg["mask_raw"], dtype=bool)
+    zyx_mask = np.array(zyx_dbg["mask_raw"], dtype=bool)
+    union_mask = nvd_mask | zyx_mask
+    overlap_mask = nvd_mask & zyx_mask
+    full_mask = np.ones_like(union_mask, dtype=bool)
+
+    def get_map(debug_maps: Dict[str, object], name: str) -> np.ndarray:
+        arr = debug_maps.get(name)
+        if arr is None:
+            return np.zeros((*union_mask.shape, 3), dtype=np.float32)
+        arr_np = np.array(arr, dtype=np.float32) / 255.0
+        if arr_np.ndim == 2:
+            arr_np = arr_np[..., None]
+        return arr_np
+
+    nvd_base = get_map(nvd_dbg["maps_filled"], "base_color")
+    nvd_m = get_map(nvd_dbg["maps_filled"], "metallic")
+    nvd_r = get_map(nvd_dbg["maps_filled"], "roughness")
+    nvd_mr = np.concatenate([np.zeros_like(nvd_m), nvd_r, nvd_m], axis=-1)
+    nvd_normal = get_map(nvd_dbg["maps_filled"], "normal")
+    zyx_base = get_map(zyx_dbg["maps_filled"], "base_color")
+    zyx_m = get_map(zyx_dbg["maps_filled"], "metallic")
+    zyx_r = get_map(zyx_dbg["maps_filled"], "roughness")
+    zyx_mr = np.concatenate([np.zeros_like(zyx_m), zyx_r, zyx_m], axis=-1)
+    zyx_normal = get_map(zyx_dbg["maps_filled"], "normal")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    png_paths = {
+        "base_color": output_dir / "gpu_voxel_base_color_side_by_side.png",
+        "metallic_roughness": output_dir / "gpu_voxel_metallic_roughness_side_by_side.png",
+        "normal": output_dir / "gpu_voxel_normal_side_by_side.png",
+    }
+    _save_side_by_side_png(nvd_base, zyx_base, png_paths["base_color"])
+    _save_side_by_side_png(nvd_mr, zyx_mr, png_paths["metallic_roughness"])
+    _save_side_by_side_png(nvd_normal, zyx_normal, png_paths["normal"])
+
+    def map_metric_pack(pred: np.ndarray, ref: np.ndarray) -> Dict[str, object]:
+        return {
+            "shared_covered": {
+                **masked_metrics(pred, ref, overlap_mask),
+                **_per_channel_error(pred, ref, overlap_mask),
             },
-            "metallic_roughness": {
-                **masked_metrics(zyx_mr, nvd_mr, union_mask),
-                **_per_channel_error(zyx_mr, nvd_mr, union_mask),
+            "full_texture": {
+                **masked_metrics(pred, ref, full_mask),
+                **_per_channel_error(pred, ref, full_mask),
             },
-            "normal": {
-                **masked_metrics(zyx_normal, nvd_normal, union_mask),
-                **_per_channel_error(zyx_normal, nvd_normal, union_mask),
-            },
+        }
+
+    return {
+        "status": "measured",
+        "mode": "voxel_input_to_glb",
+        "voxel_input_path": str(voxel_input_path.resolve()),
+        "timing_seconds": {"nvdiffrast": nvd_time, "zyrex": zyx_time},
+        "peak_vram_mb": {
+            "nvdiffrast_allocated": nvd_alloc_mb,
+            "nvdiffrast_reserved": nvd_reserved_mb,
+            "zyrex_allocated": zyx_alloc_mb,
+            "zyrex_reserved": zyx_reserved_mb,
+        },
+        "seam_coverage": {
+            "nvdiffrast_ratio": float(nvd_mask.mean()),
+            "zyrex_ratio": float(zyx_mask.mean()),
+            "union_ratio": float(union_mask.mean()),
+            "overlap_ratio": float(overlap_mask.mean()),
+            "xor_ratio": float(np.logical_xor(nvd_mask, zyx_mask).mean()),
+        },
+        "map_metrics_vs_nvdiffrast": {
+            "base_color": map_metric_pack(zyx_base, nvd_base),
+            "metallic_roughness": map_metric_pack(zyx_mr, nvd_mr),
+            "normal": map_metric_pack(zyx_normal, nvd_normal),
         },
         "side_by_side_pngs": {k: str(v.resolve()) for k, v in png_paths.items()},
     }
@@ -858,6 +1027,12 @@ def main() -> None:
     parser.add_argument("--texture-size", type=int, default=2048)
     parser.add_argument("--synthetic-texture-size", type=int, default=128, help="Texture size for synthetic CPU validation case.")
     parser.add_argument("--real-asset", type=Path, default=None, help="Optional GLB path for real-asset re-bake sanity checks.")
+    parser.add_argument(
+        "--voxel-input",
+        type=Path,
+        default=None,
+        help="Optional npz dump of production to_glb inputs (from scripts/benchmark_low_vram.py --dump-baker-input).",
+    )
     parser.add_argument("--run-gpu", action="store_true", help="Run nvdiffrast vs zyrex GPU comparison when available.")
     parser.add_argument("--render-resolution", type=int, default=192, help="CPU rendered-view resolution for real-asset comparison.")
     parser.add_argument("--render-max-faces", type=int, default=30000, help="Maximum faces to use for CPU rendered-view comparisons.")
@@ -893,12 +1068,18 @@ def main() -> None:
         "processing_time_seconds": "pending GPU run",
         "gpu_memory_mb": "pending GPU run",
     }
-    if args.run_gpu and args.real_asset is not None:
-        gpu_comparison = run_gpu_comparison_real_asset(
-            glb_path=args.real_asset,
-            texture_size=args.texture_size,
-            output_dir=args.gpu_artifacts_dir,
-        )
+    if args.run_gpu:
+        if args.voxel_input is not None:
+            gpu_comparison = run_gpu_comparison_voxel_input(
+                voxel_input_path=args.voxel_input,
+                output_dir=args.gpu_artifacts_dir,
+            )
+        elif args.real_asset is not None:
+            gpu_comparison = run_gpu_comparison_real_asset(
+                glb_path=args.real_asset,
+                texture_size=args.texture_size,
+                output_dir=args.gpu_artifacts_dir,
+            )
 
     report: Dict[str, object] = {
         "hardware": {

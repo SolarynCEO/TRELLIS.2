@@ -104,6 +104,48 @@ def test_tangent_space_normal_orientation_plane():
     assert torch.all(torch.abs(sampled[:, 1] - 0.5) < 0.1)
 
 
+def test_tangent_space_normal_has_detail_for_slanted_surface():
+    vertices = torch.tensor(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.2],
+            [1.0, 1.0, 0.4],
+            [0.0, 1.0, 0.1],
+        ],
+        dtype=torch.float32,
+    )
+    faces = torch.tensor([[0, 1, 2], [0, 2, 3]], dtype=torch.long)
+    uvs = torch.tensor(
+        [
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [1.0, 1.0],
+            [0.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+    # Varying normals to simulate non-flat tangent-space detail.
+    normals = torch.tensor(
+        [
+            [0.0, 0.0, 1.0],
+            [0.2, 0.0, 0.98],
+            [0.0, 0.3, 0.95],
+            [-0.2, 0.1, 0.97],
+        ],
+        dtype=torch.float32,
+    )
+    normals = torch.nn.functional.normalize(normals, dim=-1)
+
+    raster = rasterize_uv_triangles(uvs, faces, texture_size=64)
+    normal_map = bake_tangent_space_normal_map(vertices, faces, uvs, normals, raster)
+    sampled = normal_map[raster.mask]
+    assert sampled.shape[0] > 0
+    # x/y channels should vary and not stay flat at 0.5
+    assert float(torch.std(sampled[:, 0])) > 0.01
+    assert float(torch.std(sampled[:, 1])) > 0.01
+    assert torch.all(sampled[:, 2] > 0.5)
+
+
 def test_feature_flag_default_and_override(monkeypatch):
     monkeypatch.delenv("ZYREX_BAKER", raising=False)
     assert resolve_baker_backend() == DEFAULT_BAKER_BACKEND
