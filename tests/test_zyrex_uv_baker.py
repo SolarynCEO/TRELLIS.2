@@ -170,17 +170,43 @@ def test_uv_rasterization_matches_nvdiffrast_mask_and_face_ids():
     zyx_face = raster.face_indices.cpu()
     zyx_mask = raster.mask.cpu()
 
+    def _summarize_diff(mask_diff: torch.Tensor, face_diff: torch.Tensor, limit: int = 12) -> str:
+        coords = torch.nonzero(mask_diff | face_diff, as_tuple=False)
+        if coords.numel() == 0:
+            return "no diffs"
+        y0 = int(coords[:, 0].min().item())
+        y1 = int(coords[:, 0].max().item())
+        x0 = int(coords[:, 1].min().item())
+        x1 = int(coords[:, 1].max().item())
+        h = min(limit, y1 - y0 + 1)
+        w = min(limit, x1 - x0 + 1)
+        rows = []
+        for yy in range(y0, y0 + h):
+            chars = []
+            for xx in range(x0, x0 + w):
+                if mask_diff[yy, xx]:
+                    chars.append("M")
+                elif face_diff[yy, xx]:
+                    chars.append("F")
+                else:
+                    chars.append(".")
+            rows.append("".join(chars))
+        return f"bbox=({y0}:{y1},{x0}:{x1}) sample={rows}"
+
     mask_mismatch = torch.logical_xor(zyx_mask, nvd_mask)
     mismatch_count = int(mask_mismatch.sum().item())
+    face_diff = (zyx_face != nvd_face) & (zyx_mask & nvd_mask)
+    diff_summary = _summarize_diff(mask_mismatch, face_diff)
     # nvdiffrast uses internal fixed-point/subpixel rasterization; our plain-PyTorch
     # rasterizer targets parity but may differ on a handful of boundary texels.
     assert mismatch_count <= 4, (
-        f"mask mismatch too large vs nvdiffrast: {mismatch_count} / {texture_size * texture_size} texels"
+        f"mask mismatch too large vs nvdiffrast: {mismatch_count} / {texture_size * texture_size} texels; {diff_summary}"
     )
     shared = nvd_mask & zyx_mask
     face_mismatch_count = int((zyx_face[shared] != nvd_face[shared]).sum().item())
+    diff_summary = _summarize_diff(mask_mismatch, face_diff)
     assert face_mismatch_count <= 4, (
-        f"face-id mismatch too large on shared coverage: {face_mismatch_count} texels"
+        f"face-id mismatch too large on shared coverage: {face_mismatch_count} texels; {diff_summary}"
     )
 
 

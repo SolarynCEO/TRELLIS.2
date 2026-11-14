@@ -285,7 +285,7 @@ def _bake_maps_zyrex(
 ) -> Dict[str, Any]:
     from .zyrex_uv_baker import (
         bake_tangent_space_normal_map,
-        interpolate_vertex_attributes,
+        interpolate_masked_vertex_attributes,
         rasterize_uv_triangles,
     )
 
@@ -312,10 +312,11 @@ def _bake_maps_zyrex(
     timings: Dict[str, float] = {}
     t0 = time.perf_counter()
     raster = rasterize_uv_triangles(out_uvs, out_faces.long(), texture_size)
-    pos = interpolate_vertex_attributes(out_vertices, out_faces.long(), raster)
-    timings["rasterize_uv_and_interpolate_pos"] = time.perf_counter() - t0
+    timings["rasterize_uv"] = time.perf_counter() - t0
     t0 = time.perf_counter()
-    query_positions = pos[raster.mask]
+    query_positions = interpolate_masked_vertex_attributes(out_vertices, out_faces.long(), raster)
+    timings["interpolate_uv_to_pos"] = time.perf_counter() - t0
+    t0 = time.perf_counter()
     query_positions = map_to_original_surface(query_positions)
     timings["bvh_reproject"] = time.perf_counter() - t0
 

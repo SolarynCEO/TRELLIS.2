@@ -145,11 +145,12 @@ def rasterize_uv_triangles(
         e1 = (x - v2[:, 0]) * (v0[:, 1] - v2[:, 1]) - (y - v2[:, 1]) * (v0[:, 0] - v2[:, 0])
         e2 = (x - v0[:, 0]) * (v1[:, 1] - v0[:, 1]) - (y - v0[:, 1]) * (v1[:, 0] - v0[:, 0])
 
-        # Screen-space top-left convention in y-down image coordinates.
+        # Screen-space top-left convention in y-up image coordinates.
+        # nvdiffrast's raster output has row 0 at low clip-space Y.
         def edge_top_left(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
             dx = b[:, 0] - a[:, 0]
             dy = b[:, 1] - a[:, 1]
-            return (dy < 0) | ((dy == 0) & (dx > 0))
+            return (dy > 0) | ((dy == 0) & (dx < 0))
 
         tl0 = edge_top_left(v1, v2)
         tl1 = edge_top_left(v2, v0)
@@ -229,6 +230,21 @@ def interpolate_vertex_attributes(
     bary = raster.barycentric[raster.mask].to(values.dtype)  # [N, 3]
     out[raster.mask] = torch.sum(tri_values * bary.unsqueeze(-1), dim=1)
     return out
+
+
+def interpolate_masked_vertex_attributes(
+    values: torch.Tensor,
+    faces: torch.Tensor,
+    raster: UVRasterization,
+) -> torch.Tensor:
+    if values.dim() == 1:
+        values = values[:, None]
+    if not raster.mask.any():
+        return torch.zeros((0, values.shape[-1]), dtype=values.dtype, device=values.device)
+    face_ids = raster.face_indices[raster.mask].long()
+    tri_values = values[faces[face_ids]]
+    bary = raster.barycentric[raster.mask].to(values.dtype)
+    return torch.sum(tri_values * bary.unsqueeze(-1), dim=1)
 
 
 def _normalize_index(values: torch.Tensor, size: int) -> torch.Tensor:
