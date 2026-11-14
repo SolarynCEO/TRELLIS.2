@@ -6,6 +6,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
 from PIL import Image
 import torch
 
@@ -42,6 +43,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decimation-target", type=int, default=500_000)
     parser.add_argument("--texture-size", type=int, default=2048)
     parser.add_argument("--attention-backend", default=None, choices=["sdpa", "xformers", "flash_attn"])
+    parser.add_argument(
+        "--dump-baker-input",
+        action="store_true",
+        help="Save production to_glb baker inputs (mesh + sparse voxel attrs) for compare tooling.",
+    )
+    parser.add_argument(
+        "--baker-input-path",
+        default=None,
+        help="Optional explicit output path for baker-input npz dump.",
+    )
     return parser.parse_args()
 
 
@@ -74,6 +85,7 @@ def main() -> None:
     pipeline = Trellis2ImageTo3DPipeline.from_pretrained(args.model_id)
     pipeline.to(torch.device("cuda"))
 
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     wall_start = time.perf_counter()
     outputs, run_metrics = pipeline.run(
         image=image,
@@ -86,22 +98,54 @@ def main() -> None:
     )
     mesh = outputs[0]
     mesh.simplify(16_777_216)  # nvdiffrast face-limit guard
-    glb = o_voxel.postprocess.to_glb(
-        vertices=mesh.vertices,
-        faces=mesh.faces,
-        attr_volume=mesh.attrs,
-        coords=mesh.coords,
-        attr_layout=mesh.layout,
-        grid_size=int(round(1.0 / mesh.voxel_size)),
-        aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-        decimation_target=args.decimation_target,
-        texture_size=args.texture_size,
-        remesh=True,
-        remesh_band=1,
-        remesh_project=0,
-        use_tqdm=True,
-    )
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    bake_args_meta = {
+        "decimation_target": int(args.decimation_target),
+        "texture_size": int(args.texture_size),
+        "remesh": True,
+        "remesh_band": 1,
+        "remesh_project": 0,
+    }
+    to_glb_kwargs = {
+        "vertices": mesh.vertices,
+        "faces": mesh.faces,
+        "attr_volume": mesh.attrs,
+        "coords": mesh.coords,
+        "attr_layout": mesh.layout,
+        "grid_size": int(round(1.0 / mesh.voxel_size)),
+        "aabb": [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+        "decimation_target": bake_args_meta["decimation_target"],
+        "texture_size": bake_args_meta["texture_size"],
+        "remesh": bake_args_meta["remesh"],
+        "remesh_band": bake_args_meta["remesh_band"],
+        "remesh_project": bake_args_meta["remesh_project"],
+        "use_tqdm": True,
+    }
+    baker_input_path = None
+    if args.dump_baker_input:
+        if args.baker_input_path is not None:
+            baker_input_path = Path(args.baker_input_path)
+        else:
+            baker_input_path = output_dir / f"low_vram_baker_input_{ts}.npz"
+        baker_input_path.parent.mkdir(parents=True, exist_ok=True)
+
+        layout_meta = {
+            key: [int(sl.start), int(sl.stop)]
+            for key, sl in mesh.layout.items()
+        }
+        np_payload = {
+            "vertices": mesh.vertices.detach().cpu().numpy(),
+            "faces": mesh.faces.detach().cpu().numpy(),
+            "attrs": mesh.attrs.detach().cpu().numpy(),
+            "coords": mesh.coords.detach().cpu().numpy(),
+            "aabb": np.array([[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]], dtype=np.float32),
+            "voxel_size": np.array([mesh.voxel_size], dtype=np.float32),
+            "grid_size": np.array([int(round(1.0 / mesh.voxel_size))] * 3, dtype=np.int32),
+            "attr_layout_json": np.array([json.dumps(layout_meta)], dtype=np.str_),
+            "to_glb_args_json": np.array([json.dumps(bake_args_meta)], dtype=np.str_),
+        }
+        np.savez_compressed(str(baker_input_path), **np_payload)
+
+    glb = o_voxel.postprocess.to_glb(**to_glb_kwargs)
     glb_path = output_dir / f"low_vram_benchmark_{ts}.glb"
     glb.export(str(glb_path), extension_webp=True)
     wall_total = time.perf_counter() - wall_start
@@ -123,6 +167,7 @@ def main() -> None:
             "attention_backend": os.environ.get("ATTN_BACKEND"),
             "low_vram_env": os.environ.get("ZYREX_LOW_VRAM"),
             "low_vram_dtype_env": os.environ.get("ZYREX_LOW_VRAM_DTYPE"),
+            "baker_input_dump_path": str(baker_input_path.resolve()) if baker_input_path is not None else None,
         },
         "run_metrics": run_metrics,
         "cuda": {
