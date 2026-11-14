@@ -109,36 +109,53 @@ def test_tangent_space_normal_orientation_plane():
 def test_uv_rasterization_matches_nvdiffrast_mask_and_face_ids():
     dr = pytest.importorskip("nvdiffrast.torch")
     device = torch.device("cuda")
-    # Non-overlapping topology with shared edges + thin triangles to validate
-    # deterministic face IDs (winner is well-defined per covered texel).
-    uvs = torch.tensor(
-        [
-            [0.05, 0.05],
-            [0.95, 0.05],
-            [0.95, 0.95],
-            [0.05, 0.95],
-            [0.20, 0.20],  # interior split
-            [0.80, 0.20],
-            [0.50, 0.70],
-            [0.20, 0.80],
-            [0.80, 0.82],
-        ],
-        dtype=torch.float32,
-        device=device,
-    )
-    faces = torch.tensor(
-        [
-            [0, 1, 2],
-            [0, 2, 3],
-            [4, 5, 6],
-            [4, 6, 7],
-            [6, 5, 8],  # thin triangle near top edge
-            [7, 8, 6],  # thin edge case
-        ],
-        dtype=torch.long,
-        device=device,
-    )
+    # Build a true non-overlapping tiling over [0.05, 0.95]^2 with thin sliver rows/columns.
+    xs = [0.05, 0.30, 0.60, 0.90, 0.95]  # thin right strip [0.90, 0.95]
+    ys = [0.05, 0.12, 0.50, 0.88, 0.95]  # thin bottom/top strips
+    verts = []
+    for y in ys:
+        for x in xs:
+            verts.append([x, y])
+    uvs = torch.tensor(verts, dtype=torch.float32, device=device)
+
+    def vid(ix: int, iy: int) -> int:
+        return iy * len(xs) + ix
+
+    faces_list: list[list[int]] = []
+    for iy in range(len(ys) - 1):
+        for ix in range(len(xs) - 1):
+            v00 = vid(ix, iy)
+            v10 = vid(ix + 1, iy)
+            v01 = vid(ix, iy + 1)
+            v11 = vid(ix + 1, iy + 1)
+            if (ix + iy) % 2 == 0:
+                faces_list.append([v00, v10, v11])
+                faces_list.append([v00, v11, v01])
+            else:
+                faces_list.append([v00, v10, v01])
+                faces_list.append([v10, v11, v01])
+    faces = torch.tensor(faces_list, dtype=torch.long, device=device)
     texture_size = 256
+
+    # Verify fixture property: no texel center is strictly inside more than one triangle.
+    pts = (torch.arange(texture_size, device=device, dtype=torch.float32) + 0.5) / texture_size
+    yy, xx = torch.meshgrid(pts, pts, indexing="ij")
+    p = torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=-1)  # [P, 2]
+    tri = uvs[faces]  # [F, 3, 2]
+    a = tri[:, 0][:, None, :]
+    b = tri[:, 1][:, None, :]
+    c = tri[:, 2][:, None, :]
+    v0 = b - a
+    v1 = c - a
+    v2 = p[None, :, :] - a
+    det = v0[..., 0] * v1[..., 1] - v0[..., 1] * v1[..., 0]
+    inv_det = torch.where(det.abs() > 1e-12, 1.0 / det, torch.zeros_like(det))
+    w1 = (v2[..., 0] * v1[..., 1] - v2[..., 1] * v1[..., 0]) * inv_det
+    w2 = (v0[..., 0] * v2[..., 1] - v0[..., 1] * v2[..., 0]) * inv_det
+    w0 = 1.0 - w1 - w2
+    strictly_inside = (w0 > 1e-7) & (w1 > 1e-7) & (w2 > 1e-7)
+    cover_count = strictly_inside.sum(dim=0)
+    assert int(cover_count.max().item()) <= 1
 
     raster = rasterize_uv_triangles(uvs, faces, texture_size)
     ctx = dr.RasterizeCudaContext(device=device)

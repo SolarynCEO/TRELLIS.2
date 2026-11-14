@@ -39,6 +39,11 @@ def _resolve_zyrex_sample_chunk_size() -> int:
     return 262144
 
 
+def _resolve_emit_normal_map() -> bool:
+    # Keep production-compatible default behavior: no normal texture emitted.
+    return _is_truthy(os.environ.get("ZYREX_EMIT_NORMAL_MAP"))
+
+
 def _normalize_volume_meta(
     aabb: Union[list, tuple, np.ndarray, torch.Tensor],
     voxel_size: Union[float, list, tuple, np.ndarray, torch.Tensor, None],
@@ -276,6 +281,7 @@ def _bake_maps_zyrex(
     voxel_size: torch.Tensor,
     grid_size: torch.Tensor,
     texture_size: int,
+    emit_normal_map: bool,
 ) -> Dict[str, Any]:
     from .zyrex_uv_baker import (
         bake_tangent_space_normal_map,
@@ -324,14 +330,16 @@ def _bake_maps_zyrex(
     )
     timings["sample_attr_volume"] = time.perf_counter() - t0
     t0 = time.perf_counter()
-    normal = bake_tangent_space_normal_map(
-        vertices=out_vertices,
-        faces=out_faces.long(),
-        uvs=out_uvs,
-        vertex_normals=out_normals_t,
-        raster=raster,
-    )
-    timings["bake_normal_map"] = time.perf_counter() - t0
+    normal = None
+    if emit_normal_map:
+        normal = bake_tangent_space_normal_map(
+            vertices=out_vertices,
+            faces=out_faces.long(),
+            uvs=out_uvs,
+            vertex_normals=out_normals_t,
+            raster=raster,
+        )
+        timings["bake_normal_map"] = time.perf_counter() - t0
     t0 = time.perf_counter()
     pos_mapped = torch.zeros(texture_size, texture_size, 3, dtype=query_positions.dtype, device=query_positions.device)
     pos_mapped[raster.mask] = query_positions
@@ -341,7 +349,9 @@ def _bake_maps_zyrex(
     metallic = torch.clamp(attrs[..., attr_layout["metallic"]] * 255.0, 0.0, 255.0).byte().cpu().numpy()
     roughness = torch.clamp(attrs[..., attr_layout["roughness"]] * 255.0, 0.0, 255.0).byte().cpu().numpy()
     alpha = torch.clamp(attrs[..., attr_layout["alpha"]] * 255.0, 0.0, 255.0).byte().cpu().numpy()
-    normal = torch.clamp(normal * 255.0, 0.0, 255.0).byte().cpu().numpy()
+    normal_np = None
+    if normal is not None:
+        normal_np = torch.clamp(normal * 255.0, 0.0, 255.0).byte().cpu().numpy()
     timings["quantize_maps"] = time.perf_counter() - t0
     return {
         "mask_raw": mask_np,
@@ -354,7 +364,7 @@ def _bake_maps_zyrex(
             "metallic": metallic,
             "roughness": roughness,
             "alpha": alpha,
-            "normal": normal,
+            "normal": normal_np,
         },
     }
 
@@ -369,6 +379,7 @@ def bake_glb_maps_from_prepared(
     grid_size: torch.Tensor,
     texture_size: int,
     backend: str,
+    emit_normal_map: bool = False,
 ) -> Dict[str, Any]:
     if backend == "nvdiffrast":
         baked = _bake_maps_nvdiffrast(prepared, attr_volume, coords, attr_layout, aabb, voxel_size, grid_size, texture_size)
@@ -382,6 +393,7 @@ def bake_glb_maps_from_prepared(
             voxel_size,
             grid_size,
             texture_size,
+            emit_normal_map=emit_normal_map,
         )
     else:
         raise NotImplementedError(
@@ -528,6 +540,7 @@ def to_glb(
         grid_size=grid_size,
         texture_size=texture_size,
         backend=backend,
+        emit_normal_map=_resolve_emit_normal_map(),
     )
     if use_tqdm:
         pbar.update(1)
