@@ -196,8 +196,9 @@ def _bake_maps_nvdiffrast(
     if dr is None:
         raise ImportError("nvdiffrast is required for ZYREX_BAKER=nvdiffrast but is not importable.")
 
-    out_vertices = prepared["out_vertices"]
-    out_faces = prepared["out_faces"]
+    out_vertices = prepared["out_vertices"].to(torch.float32).contiguous()
+    out_faces = prepared["out_faces"].to(torch.int32).contiguous()
+    out_uvs = prepared["out_uvs"].to(torch.float32).contiguous()
     bvh = prepared["bvh"]
     src_vertices = prepared["source_vertices"]
     src_faces = prepared["source_faces"]
@@ -207,16 +208,17 @@ def _bake_maps_nvdiffrast(
     ctx = dr.RasterizeCudaContext()
     uvs_rast = torch.cat(
         [
-            prepared["out_uvs"] * 2 - 1,
-            torch.zeros_like(prepared["out_uvs"][:, :1]),
-            torch.ones_like(prepared["out_uvs"][:, :1]),
+            out_uvs * 2 - 1,
+            torch.zeros_like(out_uvs[:, :1]),
+            torch.ones_like(out_uvs[:, :1]),
         ],
         dim=-1,
-    ).unsqueeze(0)
-    rast = torch.zeros((1, texture_size, texture_size, 4), device="cuda", dtype=torch.float32)
+    ).unsqueeze(0).contiguous()
+    rast = torch.zeros((1, texture_size, texture_size, 4), device=out_vertices.device, dtype=torch.float32)
 
     for i in range(0, out_faces.shape[0], 100000):
-        rast_chunk, _ = dr.rasterize(ctx, uvs_rast, out_faces[i : i + 100000], resolution=[texture_size, texture_size])
+        face_chunk = out_faces[i : i + 100000].contiguous()
+        rast_chunk, _ = dr.rasterize(ctx, uvs_rast, face_chunk, resolution=[texture_size, texture_size])
         mask_chunk = rast_chunk[..., 3:4] > 0
         rast_chunk[..., 3:4] += i
         rast = torch.where(mask_chunk, rast_chunk, rast)

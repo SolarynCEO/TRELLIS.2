@@ -497,7 +497,7 @@ def test_bake_glb_maps_from_prepared_zyrex_matches_nvdiffrast_tiny(monkeypatch):
         dtype=torch.float32,
         device=device,
     )
-    out_faces = torch.tensor([[0, 1, 2]], dtype=torch.long, device=device)
+    out_faces = torch.tensor([[0, 1, 2]], dtype=torch.int32, device=device)
     out_uvs = torch.tensor(
         [[0.05, 0.05], [0.95, 0.05], [0.05, 0.95]],
         dtype=torch.float32,
