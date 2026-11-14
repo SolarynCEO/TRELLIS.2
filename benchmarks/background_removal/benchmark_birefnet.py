@@ -5,6 +5,8 @@ import os
 import platform
 import threading
 import time
+import urllib.parse
+import urllib.request
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,9 +18,16 @@ import torch
 from PIL import Image, ImageDraw
 
 from trellis2.pipelines.rembg import BiRefNet, NON_COMMERCIAL_RMBG_MODEL_NAME
+from trellis2.pipelines.rembg.preprocess_utils import frame_rgba_with_fallback, premultiply_rgba_to_rgb
 
 
-THRESHOLD_ALPHA = int(0.8 * 255)
+MASK_BIN_THRESHOLD = 0.5
+IOU_RESOLUTION = 1024
+VARIANT_DEFAULTS = [
+    "ZhengPeng7/BiRefNet",
+    "ZhengPeng7/BiRefNet_dynamic",
+    "ZhengPeng7/BiRefNet_HR",
+]
 
 
 @dataclass
@@ -30,12 +39,10 @@ class RunResult:
     peak_rss_mb: float
     alpha_coverage: float
     soft_edge_fraction: float
-    source_bbox_xyxy: list[int]
-    frame_bbox_xyxy: list[int]
-    frame_center_offset_px: list[float]
+    frame_metadata: dict[str, Any]
 
 
-def _bbox_from_alpha(alpha_uint8: np.ndarray, threshold: int = THRESHOLD_ALPHA) -> list[int]:
+def _bbox_from_alpha(alpha_uint8: np.ndarray, threshold: int) -> list[int]:
     indices = np.argwhere(alpha_uint8 > threshold)
     if indices.size == 0:
         h, w = alpha_uint8.shape
@@ -51,44 +58,22 @@ def _center_from_bbox(bbox: list[int]) -> tuple[float, float]:
     return ((bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0)
 
 
-def _apply_trellis_framing(rgba_image: Image.Image) -> tuple[Image.Image, Image.Image, dict[str, Any]]:
-    output_np = np.array(rgba_image)
-    alpha = output_np[:, :, 3]
-    bbox = _bbox_from_alpha(alpha, threshold=THRESHOLD_ALPHA)
-    center = _center_from_bbox(bbox)
-    size = max(bbox[2] - bbox[0], bbox[3] - bbox[1])
-    size = int(size * 1)
-    crop_box = (
-        center[0] - size // 2,
-        center[1] - size // 2,
-        center[0] + size // 2,
-        center[1] + size // 2,
-    )
-    framed_rgba = rgba_image.crop(crop_box)
-
-    framed_np = np.array(framed_rgba).astype(np.float32) / 255.0
-    framed_rgb_np = framed_np[:, :, :3] * framed_np[:, :, 3:4]
-    framed_rgb = Image.fromarray((framed_rgb_np * 255).astype(np.uint8))
-
-    frame_alpha = np.array(framed_rgba)[:, :, 3]
-    frame_bbox = _bbox_from_alpha(frame_alpha, threshold=THRESHOLD_ALPHA)
+def _add_frame_stats(frame_rgba: Image.Image, frame_metadata: dict[str, Any]) -> dict[str, Any]:
+    frame_alpha = np.array(frame_rgba)[:, :, 3]
+    frame_bbox = _bbox_from_alpha(frame_alpha, threshold=int(0.8 * 255))
     frame_center = _center_from_bbox(frame_bbox)
-    image_center = ((framed_rgba.width - 1) / 2.0, (framed_rgba.height - 1) / 2.0)
-
-    stats = {
-        "source_bbox_xyxy": bbox,
-        "frame_bbox_xyxy": frame_bbox,
-        "frame_center_offset_px": [
-            round(frame_center[0] - image_center[0], 4),
-            round(frame_center[1] - image_center[1], 4),
-        ],
-    }
-    return framed_rgb, framed_rgba, stats
+    image_center = ((frame_rgba.width - 1) / 2.0, (frame_rgba.height - 1) / 2.0)
+    frame_metadata["frame_bbox_xyxy"] = frame_bbox
+    frame_metadata["frame_center_offset_px"] = [
+        round(frame_center[0] - image_center[0], 4),
+        round(frame_center[1] - image_center[1], 4),
+    ]
+    return frame_metadata
 
 
 def _compute_mask_stats(alpha_uint8: np.ndarray) -> tuple[float, float]:
     alpha = alpha_uint8.astype(np.float32) / 255.0
-    coverage = float(np.mean(alpha > 0.5))
+    coverage = float(np.mean(alpha > MASK_BIN_THRESHOLD))
     soft_edge_fraction = float(np.mean((alpha > 0.05) & (alpha < 0.95)))
     return coverage, soft_edge_fraction
 
@@ -121,7 +106,12 @@ def _run_pipeline_preprocess(model: BiRefNet, image: Image.Image) -> RunResult:
     rgba_np = np.array(rgba)
     alpha = rgba_np[:, :, 3]
     coverage, soft_edge_fraction = _compute_mask_stats(alpha)
-    framed_rgb, framed_rgba, frame_stats = _apply_trellis_framing(rgba)
+    framed_rgba, frame_stats = frame_rgba_with_fallback(
+        rgba,
+        warning_context="benchmark-preprocess",
+    )
+    frame_stats = _add_frame_stats(framed_rgba, frame_stats)
+    framed_rgb = premultiply_rgba_to_rgb(framed_rgba)
 
     return RunResult(
         rgba=rgba,
@@ -131,9 +121,7 @@ def _run_pipeline_preprocess(model: BiRefNet, image: Image.Image) -> RunResult:
         peak_rss_mb=peak_rss_mb,
         alpha_coverage=coverage,
         soft_edge_fraction=soft_edge_fraction,
-        source_bbox_xyxy=frame_stats["source_bbox_xyxy"],
-        frame_bbox_xyxy=frame_stats["frame_bbox_xyxy"],
-        frame_center_offset_px=frame_stats["frame_center_offset_px"],
+        frame_metadata=frame_stats,
     )
 
 
@@ -143,6 +131,22 @@ def _mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
     intersection = np.logical_and(a, b).sum()
     union = np.logical_or(a, b).sum()
     return float(intersection / union) if union > 0 else 0.0
+
+
+def _normalized_framed_mask_for_iou(
+    rgba_image: Image.Image,
+    *,
+    resolution: int = IOU_RESOLUTION,
+    threshold: float = MASK_BIN_THRESHOLD,
+) -> np.ndarray:
+    framed_rgba, _ = frame_rgba_with_fallback(
+        rgba_image,
+        warning_context="benchmark-iou",
+    )
+    normalized_alpha = np.array(
+        framed_rgba.resize((resolution, resolution), Image.Resampling.BILINEAR)
+    )[:, :, 3]
+    return normalized_alpha > threshold * 255
 
 
 def _preprocess_tensor_stats(image: Image.Image, image_size: int) -> dict[str, Any]:
@@ -207,6 +211,29 @@ def _contact_sheet(
     sheet.save(output_path)
 
 
+def _slugify(text: str) -> str:
+    return "".join(c if c.isalnum() else "-" for c in text).strip("-").lower()
+
+
+def _fetch_hf_model_metadata(model_id: str) -> dict[str, Any]:
+    url = f"https://huggingface.co/api/models/{urllib.parse.quote(model_id, safe='/')}"
+    req = urllib.request.Request(url, headers={"User-Agent": "TRELLIS.2-background-benchmark/1.0"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    card_data = payload.get("cardData") or {}
+    license_value = (card_data.get("license") or "").lower()
+    permissive_prefixes = ("mit", "apache", "bsd", "isc", "zlib", "cc0")
+    is_permissive = any(license_value.startswith(prefix) for prefix in permissive_prefixes)
+    return {
+        "model_id": model_id,
+        "revision": payload.get("sha"),
+        "license": license_value or None,
+        "is_permissive": is_permissive,
+        "tags": payload.get("tags", []),
+        "url": f"https://huggingface.co/{model_id}",
+    }
+
+
 def _load_warlord_from_zip(zip_path: Path) -> dict[str, Image.Image]:
     with zipfile.ZipFile(zip_path) as zf:
         with zf.open("reference.jpg") as f:
@@ -247,6 +274,17 @@ def main() -> None:
         type=Path,
         default=Path("/opt/cursor/artifacts/birefnet-benchmark"),
     )
+    parser.add_argument(
+        "--variant-model",
+        action="append",
+        dest="variant_models",
+        help="HF model repo id to benchmark (repeatable). Defaults to standard + dynamic + HR variants.",
+    )
+    parser.add_argument(
+        "--iou-size",
+        type=int,
+        default=IOU_RESOLUTION,
+    )
     args = parser.parse_args()
 
     args.artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -276,9 +314,6 @@ def main() -> None:
             }
         )
 
-    new_model = BiRefNet()
-    new_model.cpu()
-
     old_model: Optional[BiRefNet] = None
     old_model_error: Optional[str] = None
     try:
@@ -287,88 +322,142 @@ def main() -> None:
     except Exception as exc:
         old_model_error = f"{type(exc).__name__}: {exc}"
 
-    results: list[dict[str, Any]] = []
-    for row in images:
-        image: Image.Image = row["image"]
-        new_result = _run_pipeline_preprocess(new_model, image)
+    variant_model_ids = args.variant_models or list(VARIANT_DEFAULTS)
+    variants: list[dict[str, Any]] = []
+    for model_id in variant_model_ids:
+        metadata = _fetch_hf_model_metadata(model_id)
+        if metadata["revision"] is None:
+            variants.append(
+                {
+                    "metadata": metadata,
+                    "error": "missing model revision (sha) from HF API",
+                    "results": [],
+                }
+            )
+            continue
 
-        baseline_iou = None
-        baseline_kind = None
-        old_runtime_s = None
-        old_peak_rss_mb = None
-        old_coverage = None
-        old_soft_edges = None
-        old_rgba = None
+        try:
+            variant_model = BiRefNet(
+                model_name=model_id,
+                revision=metadata["revision"],
+            )
+            variant_model.cpu()
+        except Exception as exc:
+            variants.append(
+                {
+                    "metadata": metadata,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "results": [],
+                }
+            )
+            continue
 
-        if old_model is not None:
-            old_result = _run_pipeline_preprocess(old_model, image)
-            old_rgba = old_result.rgba
-            old_runtime_s = old_result.runtime_s
-            old_peak_rss_mb = old_result.peak_rss_mb
-            old_coverage = old_result.alpha_coverage
-            old_soft_edges = old_result.soft_edge_fraction
-            old_mask = np.array(old_result.rgba)[:, :, 3] > THRESHOLD_ALPHA
-            new_mask = np.array(new_result.rgba)[:, :, 3] > THRESHOLD_ALPHA
-            baseline_iou = _mask_iou(new_mask, old_mask)
-            baseline_kind = "rmbg_2_0"
-        elif row["baseline_rgba"] is not None:
-            baseline_mask = np.array(row["baseline_rgba"].resize(new_result.rgba.size, Image.Resampling.BILINEAR))[:, :, 3] > THRESHOLD_ALPHA
-            new_mask = np.array(new_result.rgba)[:, :, 3] > THRESHOLD_ALPHA
-            baseline_iou = _mask_iou(new_mask, baseline_mask)
-            baseline_kind = "provided_cutout_square_rgba"
+        variant_results: list[dict[str, Any]] = []
+        variant_slug = _slugify(model_id)
+        for row in images:
+            image: Image.Image = row["image"]
+            new_result = _run_pipeline_preprocess(variant_model, image)
 
-        row_artifact = args.artifacts_dir / f"contact_sheet_{row['id']}.png"
-        _contact_sheet(
-            original=image,
-            new_rgba=new_result.rgba,
-            new_framed=new_result.framed_rgb,
-            baseline_rgba=old_rgba if old_rgba is not None else row["baseline_rgba"],
-            output_path=row_artifact,
-        )
+            baseline_iou = None
+            baseline_kind = None
+            old_runtime_s = None
+            old_peak_rss_mb = None
+            old_coverage = None
+            old_soft_edges = None
+            old_rgba = None
 
-        preproc_stats_512 = _preprocess_tensor_stats(new_result.framed_rgb, image_size=512)
-        preproc_stats_1024 = _preprocess_tensor_stats(new_result.framed_rgb, image_size=1024)
-        preproc_stats_518 = _preprocess_tensor_stats(new_result.framed_rgb, image_size=518)
+            if old_model is not None:
+                old_result = _run_pipeline_preprocess(old_model, image)
+                old_rgba = old_result.rgba
+                old_runtime_s = old_result.runtime_s
+                old_peak_rss_mb = old_result.peak_rss_mb
+                old_coverage = old_result.alpha_coverage
+                old_soft_edges = old_result.soft_edge_fraction
+                old_mask = np.array(old_result.rgba)[:, :, 3] > MASK_BIN_THRESHOLD * 255
+                new_mask = np.array(new_result.rgba)[:, :, 3] > MASK_BIN_THRESHOLD * 255
+                baseline_iou = _mask_iou(new_mask, old_mask)
+                baseline_kind = "rmbg_2_0_source_aligned"
+            elif row["baseline_rgba"] is not None:
+                baseline_mask = _normalized_framed_mask_for_iou(
+                    row["baseline_rgba"],
+                    resolution=args.iou_size,
+                    threshold=MASK_BIN_THRESHOLD,
+                )
+                new_mask = _normalized_framed_mask_for_iou(
+                    new_result.rgba,
+                    resolution=args.iou_size,
+                    threshold=MASK_BIN_THRESHOLD,
+                )
+                baseline_iou = _mask_iou(new_mask, baseline_mask)
+                baseline_kind = "provided_cutout_framed_aligned"
 
-        result_row = {
-            "id": row["id"],
-            "title": row["title"],
-            "license": row["license"],
-            "source_url": row["source_url"],
-            "edge_case": row.get("edge_case"),
-            "new_runtime_s": new_result.runtime_s,
-            "new_peak_rss_mb": new_result.peak_rss_mb,
-            "new_alpha_coverage": new_result.alpha_coverage,
-            "new_soft_edge_fraction": new_result.soft_edge_fraction,
-            "new_source_bbox_xyxy": new_result.source_bbox_xyxy,
-            "new_frame_bbox_xyxy": new_result.frame_bbox_xyxy,
-            "new_frame_size": list(new_result.framed_rgb.size),
-            "new_frame_center_offset_px": new_result.frame_center_offset_px,
-            "old_runtime_s": old_runtime_s,
-            "old_peak_rss_mb": old_peak_rss_mb,
-            "old_alpha_coverage": old_coverage,
-            "old_soft_edge_fraction": old_soft_edges,
-            "mask_iou_against_old_or_baseline": baseline_iou,
-            "comparison_basis": baseline_kind,
-            "contact_sheet": str(row_artifact),
-            "preprocess_tensor_512": preproc_stats_512,
-            "preprocess_tensor_1024": preproc_stats_1024,
-            "preprocess_tensor_518": preproc_stats_518,
-        }
+            row_artifact = args.artifacts_dir / f"contact_sheet_{variant_slug}_{row['id']}.png"
+            _contact_sheet(
+                original=image,
+                new_rgba=new_result.rgba,
+                new_framed=new_result.framed_rgb,
+                baseline_rgba=old_rgba if old_rgba is not None else row["baseline_rgba"],
+                output_path=row_artifact,
+            )
 
-        if row["baseline_preprocessed"] is not None:
-            result_row["provided_preprocessed_size"] = list(row["baseline_preprocessed"].size)
-        results.append(result_row)
-        print(
-            f"{row['id']}: runtime={new_result.runtime_s:.3f}s peak_delta={new_result.peak_rss_mb:.1f}MB "
-            f"coverage={new_result.alpha_coverage:.4f} soft={new_result.soft_edge_fraction:.4f}"
+            preproc_stats_512 = _preprocess_tensor_stats(new_result.framed_rgb, image_size=512)
+            preproc_stats_1024 = _preprocess_tensor_stats(new_result.framed_rgb, image_size=1024)
+            preproc_stats_518 = _preprocess_tensor_stats(new_result.framed_rgb, image_size=518)
+
+            result_row = {
+                "id": row["id"],
+                "title": row["title"],
+                "license": row["license"],
+                "source_url": row["source_url"],
+                "edge_case": row.get("edge_case"),
+                "new_runtime_s": new_result.runtime_s,
+                "new_peak_rss_mb": new_result.peak_rss_mb,
+                "new_alpha_coverage": new_result.alpha_coverage,
+                "new_soft_edge_fraction": new_result.soft_edge_fraction,
+                "new_source_bbox_xyxy": new_result.frame_metadata.get("bbox_xyxy"),
+                "new_frame_bbox_xyxy": new_result.frame_metadata.get("frame_bbox_xyxy"),
+                "new_frame_size": list(new_result.framed_rgb.size),
+                "new_frame_center_offset_px": new_result.frame_metadata.get("frame_center_offset_px"),
+                "new_fallback_used": new_result.frame_metadata.get("fallback_used"),
+                "new_fallback_reason": new_result.frame_metadata.get("fallback_reason"),
+                "old_runtime_s": old_runtime_s,
+                "old_peak_rss_mb": old_peak_rss_mb,
+                "old_alpha_coverage": old_coverage,
+                "old_soft_edge_fraction": old_soft_edges,
+                "mask_iou_against_old_or_baseline": baseline_iou,
+                "comparison_basis": baseline_kind,
+                "contact_sheet": str(row_artifact),
+                "preprocess_tensor_512": preproc_stats_512,
+                "preprocess_tensor_1024": preproc_stats_1024,
+                "preprocess_tensor_518": preproc_stats_518,
+            }
+
+            if row["baseline_preprocessed"] is not None:
+                result_row["provided_preprocessed_size"] = list(row["baseline_preprocessed"].size)
+            variant_results.append(result_row)
+            print(
+                f"{model_id} :: {row['id']}: runtime={new_result.runtime_s:.3f}s "
+                f"peak_delta={new_result.peak_rss_mb:.1f}MB coverage={new_result.alpha_coverage:.4f} "
+                f"fallback={bool(new_result.frame_metadata.get('fallback_used'))}"
+            )
+
+        variants.append(
+            {
+                "metadata": metadata,
+                "error": None,
+                "results": variant_results,
+            }
         )
 
     payload = {
-        "model": {
-            "repo": "ZhengPeng7/BiRefNet",
-            "revision": "e2bf8e4460fc8fa32bba5ea4d94b3233d367b0e4",
-            "license": "MIT",
+        "iou_method": {
+            "description": (
+                "For provided baseline cutouts, both masks are independently reframed with the "
+                "same TRELLIS framing function, resized to a common square resolution, thresholded "
+                "at alpha>0.5, then compared with IoU."
+            ),
+            "normalized_resolution": args.iou_size,
+            "alpha_threshold": MASK_BIN_THRESHOLD,
         },
         "old_rmbg_attempt": {
             "model_name": NON_COMMERCIAL_RMBG_MODEL_NAME,
@@ -383,7 +472,7 @@ def main() -> None:
             "cpu_count_logical": psutil.cpu_count(logical=True),
             "ram_total_gb": round(psutil.virtual_memory().total / (1024 ** 3), 2),
         },
-        "results": results,
+        "variants": variants,
     }
 
     output_json = args.artifacts_dir / "benchmark_results.json"

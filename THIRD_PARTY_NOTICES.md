@@ -149,6 +149,12 @@ Used by default in this fork via `trellis2/pipelines/rembg/BiRefNet.py` and
 
 - repo: `ZhengPeng7/BiRefNet`
 - pinned revision: `e2bf8e4460fc8fa32bba5ea4d94b3233d367b0e4`
+- license metadata: `MIT`
+
+Additional evaluated BiRefNet variants (not defaulted in pipeline config):
+
+- `ZhengPeng7/BiRefNet_dynamic` @ `280306042f57b7a33854319da62fd86aaa89ec4c` (license metadata: `MIT`)
+- `ZhengPeng7/BiRefNet_HR` @ `a7a562f6fd16021180f2f4348f4de003a2d3d1e1` (license metadata: `MIT`)
 
 Commercial use / redistribution: permissive per MIT metadata.
 
