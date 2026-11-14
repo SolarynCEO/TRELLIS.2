@@ -66,7 +66,6 @@ Run from the repository root in PowerShell:
 
 ```powershell
 $env:ZYREX_LOW_VRAM = "1"
-$env:PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
 
 py -3 trellis2\utils\zyrex_baker_compare.py `
   --output "outputs\benchmarks\zyrex_gpu_compare_2048.json" `
@@ -78,6 +77,8 @@ py -3 trellis2\utils\zyrex_baker_compare.py `
   --gpu-artifacts-dir "outputs\benchmarks\zyrex_gpu_compare_2048_artifacts"
 ```
 
+Note: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is currently unsupported on Windows; do not set it for this command.
+
 Expected outputs:
 
 - JSON metrics including time, peak VRAM (allocated/reserved), seam coverage, and map error vs `nvdiffrast`
@@ -85,3 +86,17 @@ Expected outputs:
   - base color
   - metallic/roughness
   - normal maps
+
+### Synthetic rasterizer timing proxy (no GPU required)
+
+If you only need a rough throughput check of the rasterizer path, run:
+
+```powershell
+py -3 trellis2\utils\zyrex_baker_compare.py `
+  --output "outputs\benchmarks\zyrex_rasterizer_proxy.json" `
+  --benchmark-rasterizer-faces 500000 `
+  --benchmark-rasterizer-resolution 512 `
+  --skip-rendered-views
+```
+
+This emits `rasterizer_proxy_benchmark` timing and coverage metrics in the output JSON.

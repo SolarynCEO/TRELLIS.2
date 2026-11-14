@@ -5,7 +5,6 @@ import importlib.util
 import json
 import math
 import platform
-import resource
 import sys
 import time
 from pathlib import Path
@@ -15,6 +14,16 @@ import numpy as np
 from PIL import Image
 import torch
 import torch.nn.functional as F
+
+try:
+    import resource  # Unix-only
+except Exception:  # pragma: no cover - exercised on Windows
+    resource = None
+
+try:
+    import psutil
+except Exception:  # pragma: no cover - optional fallback
+    psutil = None
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -36,6 +45,20 @@ dilate_texture = _ZYREX_MODULE.dilate_texture
 interpolate_vertex_attributes = _ZYREX_MODULE.interpolate_vertex_attributes
 rasterize_uv_triangles = _ZYREX_MODULE.rasterize_uv_triangles
 sample_sparse_volume_trilinear = _ZYREX_MODULE.sample_sparse_volume_trilinear
+
+
+def _progress(stage: str, started_at: float) -> None:
+    elapsed = time.perf_counter() - started_at
+    print(f"[zyrex_baker_compare] {stage} (+{elapsed:.2f}s)", flush=True)
+
+
+def _peak_rss_mb() -> float:
+    if resource is not None:
+        return float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0)
+    if psutil is not None:
+        process = psutil.Process()
+        return float(process.memory_info().rss / (1024.0**2))
+    return float("nan")
 
 
 def psnr(pred: np.ndarray, target: np.ndarray, eps: float = 1e-12) -> float:
@@ -140,10 +163,13 @@ def synthetic_case(
 
 
 def run_synthetic_cpu(texture_size: int = 128) -> Dict[str, object]:
+    started = time.perf_counter()
+    _progress("synthetic_cpu: setup", started)
     torch.manual_seed(0)
     np.random.seed(0)
     case = synthetic_case(texture_size=texture_size, device="cpu")
     t0 = time.perf_counter()
+    _progress("synthetic_cpu: bake start", started)
     baked = bake_voxel_pbr_maps(
         vertices=case["vertices"],
         faces=case["faces"],
@@ -158,6 +184,7 @@ def run_synthetic_cpu(texture_size: int = 128) -> Dict[str, object]:
         texture_size=texture_size,
         seam_padding_iterations=6,
     )
+    _progress("synthetic_cpu: bake done", started)
     elapsed = time.perf_counter() - t0
     mask = baked["mask"].cpu().numpy().astype(bool)
 
@@ -169,7 +196,7 @@ def run_synthetic_cpu(texture_size: int = 128) -> Dict[str, object]:
 
     normal = baked["normal"][baked["mask"]]
     normal_ok = bool(torch.all(normal[:, 2] > 0.95).item()) if normal.numel() > 0 else False
-    rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+    rss_mb = _peak_rss_mb()
     return {
         "texture_size": texture_size,
         "coverage_ratio": float(mask.mean()),
@@ -178,6 +205,38 @@ def run_synthetic_cpu(texture_size: int = 128) -> Dict[str, object]:
         "processing_time_seconds": elapsed,
         "peak_rss_mb": rss_mb,
     }
+
+
+def run_rasterizer_proxy_benchmark(
+    num_faces: int = 500_000,
+    resolution: int = 512,
+) -> Dict[str, object]:
+    started = time.perf_counter()
+    _progress(f"rasterizer_proxy: start faces={num_faces} res={resolution}", started)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    verts = torch.rand((num_faces * 3, 2), dtype=torch.float32, device=device)
+    faces = torch.arange(num_faces * 3, dtype=torch.long, device=device).view(num_faces, 3)
+    if device == "cuda":
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+    t0 = time.perf_counter()
+    rast = rasterize_uv_triangles(verts, faces, texture_size=resolution)
+    if device == "cuda":
+        torch.cuda.synchronize()
+    elapsed = time.perf_counter() - t0
+    _progress("rasterizer_proxy: done", started)
+    result: Dict[str, object] = {
+        "status": "measured",
+        "device": device,
+        "faces": num_faces,
+        "resolution": resolution,
+        "coverage_ratio": float(rast.mask.float().mean().item()),
+        "elapsed_seconds": elapsed,
+    }
+    if device == "cuda":
+        result["peak_vram_allocated_mb"] = float(torch.cuda.max_memory_allocated() / (1024**2))
+        result["peak_vram_reserved_mb"] = float(torch.cuda.max_memory_reserved() / (1024**2))
+    return result
 
 
 def _sample_texture(image: np.ndarray, uv: np.ndarray) -> np.ndarray:
@@ -479,6 +538,8 @@ def run_real_asset_rebake(
     render_resolution: int = 192,
     render_max_faces: int = 30000,
 ) -> Dict[str, object]:
+    started = time.perf_counter()
+    _progress("real_asset: load mesh", started)
     mesh = _extract_first_textured_mesh(glb_path)
     material = mesh.visual.material
     base = np.array(material.baseColorTexture.convert("RGBA"))
@@ -492,6 +553,7 @@ def run_real_asset_rebake(
     faces = torch.from_numpy(mesh.faces.astype(np.int64))
     raster = rasterize_uv_triangles(uvs, faces, (h, w))
     uv_map = interpolate_vertex_attributes(uvs, faces, raster).cpu().numpy()
+    _progress("real_asset: UV rasterized", started)
     footprint_mask = raster.mask.cpu().numpy().astype(bool)
     source_coverage_mask = base[..., 3] > 0
     union_mask = footprint_mask | source_coverage_mask
@@ -505,6 +567,7 @@ def run_real_asset_rebake(
 
     rebaked_base_t = dilate_texture(torch.from_numpy(rebaked_base), torch.from_numpy(footprint_mask), iterations=6).numpy()
     rebaked_mr_t = dilate_texture(torch.from_numpy(rebaked_mr), torch.from_numpy(footprint_mask), iterations=6).numpy()
+    _progress("real_asset: map rebake complete", started)
     base_ref = base.astype(np.float32) / 255.0
     mr_ref = mr_tex.astype(np.float32) / 255.0
 
@@ -545,6 +608,7 @@ def run_real_asset_rebake(
 
     if render_views:
         try:
+            _progress("real_asset: rendered-view comparison start", started)
             results["rendered_view_metrics"] = _rendered_view_metrics(
                 vertices=mesh.vertices.astype(np.float32),
                 faces=mesh.faces.astype(np.int64),
@@ -554,6 +618,7 @@ def run_real_asset_rebake(
                 resolution=render_resolution,
                 max_faces=render_max_faces,
             )
+            _progress("real_asset: rendered-view comparison done", started)
         except Exception as exc:
             results["rendered_view_metrics"] = {
                 "status": "pending CPU render comparison",
@@ -569,6 +634,7 @@ def run_gpu_comparison_real_asset(
     texture_size: int,
     output_dir: Path,
 ) -> Dict[str, object]:
+    started = time.perf_counter()
     if not torch.cuda.is_available():
         return {
             "status": "pending GPU run",
@@ -582,6 +648,7 @@ def run_gpu_comparison_real_asset(
             "reason": "nvdiffrast is required for --run-gpu real-asset comparison.",
         }
 
+    _progress("gpu_real_asset: load mesh", started)
     mesh = _extract_first_textured_mesh(glb_path)
     material = mesh.visual.material
     base = np.array(material.baseColorTexture.convert("RGBA"), dtype=np.float32) / 255.0
@@ -598,6 +665,7 @@ def run_gpu_comparison_real_asset(
     mr_t = torch.from_numpy(mr).cuda()
     normal_t = torch.from_numpy(normal).cuda()
 
+    _progress("gpu_real_asset: nvdiffrast bake start", started)
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     t0 = time.perf_counter()
@@ -607,6 +675,7 @@ def run_gpu_comparison_real_asset(
     nvd_alloc_mb = torch.cuda.max_memory_allocated() / (1024**2)
     nvd_reserved_mb = torch.cuda.max_memory_reserved() / (1024**2)
 
+    _progress("gpu_real_asset: zyrex bake start", started)
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     t1 = time.perf_counter()
@@ -615,6 +684,7 @@ def run_gpu_comparison_real_asset(
     zyx_time = time.perf_counter() - t1
     zyx_alloc_mb = torch.cuda.max_memory_allocated() / (1024**2)
     zyx_reserved_mb = torch.cuda.max_memory_reserved() / (1024**2)
+    _progress("gpu_real_asset: both bakes complete", started)
 
     nvd_mask = nvd["mask"].detach().cpu().numpy().astype(bool)
     zyx_mask = zyx["mask"].detach().cpu().numpy().astype(bool)
@@ -637,6 +707,7 @@ def run_gpu_comparison_real_asset(
     _save_side_by_side_png(nvd_base, zyx_base, png_paths["base_color"])
     _save_side_by_side_png(nvd_mr, zyx_mr, png_paths["metallic_roughness"])
     _save_side_by_side_png(nvd_normal, zyx_normal, png_paths["normal"])
+    _progress("gpu_real_asset: side-by-side PNGs written", started)
 
     return {
         "status": "measured",
@@ -716,6 +787,7 @@ def nvdiffrast_reference_bake(
 
 
 def run_gpu_comparison(texture_size: int) -> Dict[str, object]:
+    started = time.perf_counter()
     pending = {
         "status": "pending GPU run",
         "reason": "CUDA and nvdiffrast are required to run side-by-side comparisons.",
@@ -734,10 +806,12 @@ def run_gpu_comparison(texture_size: int) -> Dict[str, object]:
     torch.manual_seed(0)
     np.random.seed(0)
     case = synthetic_case(texture_size=texture_size, device="cuda")
+    _progress("gpu_synthetic: nvdiffrast reference start", started)
     t0 = time.perf_counter()
     ref = nvdiffrast_reference_bake(case, texture_size=texture_size)
     ref_t = time.perf_counter() - t0
 
+    _progress("gpu_synthetic: zyrex bake start", started)
     torch.cuda.reset_peak_memory_stats()
     t1 = time.perf_counter()
     zyrex = bake_voxel_pbr_maps(
@@ -756,6 +830,7 @@ def run_gpu_comparison(texture_size: int) -> Dict[str, object]:
     )
     zyrex_t = time.perf_counter() - t1
     peak_mem_mb = torch.cuda.max_memory_allocated() / (1024**2)
+    _progress("gpu_synthetic: metrics", started)
 
     mask = ref["mask"].numpy().astype(bool) & zyrex["mask"].cpu().numpy().astype(bool)
     map_metrics = {}
@@ -787,6 +862,18 @@ def main() -> None:
     parser.add_argument("--render-resolution", type=int, default=192, help="CPU rendered-view resolution for real-asset comparison.")
     parser.add_argument("--render-max-faces", type=int, default=30000, help="Maximum faces to use for CPU rendered-view comparisons.")
     parser.add_argument("--skip-rendered-views", action="store_true", help="Skip CPU rendered-view comparison for real assets.")
+    parser.add_argument(
+        "--benchmark-rasterizer-faces",
+        type=int,
+        default=0,
+        help="Optional synthetic rasterizer benchmark face count (e.g. 500000).",
+    )
+    parser.add_argument(
+        "--benchmark-rasterizer-resolution",
+        type=int,
+        default=512,
+        help="Texture resolution for synthetic rasterizer benchmark.",
+    )
     parser.add_argument(
         "--gpu-artifacts-dir",
         type=Path,
@@ -832,6 +919,14 @@ def main() -> None:
         )
     else:
         report["real_asset"] = {"status": "not_run"}
+
+    if args.benchmark_rasterizer_faces > 0:
+        report["rasterizer_proxy_benchmark"] = run_rasterizer_proxy_benchmark(
+            num_faces=args.benchmark_rasterizer_faces,
+            resolution=args.benchmark_rasterizer_resolution,
+        )
+    else:
+        report["rasterizer_proxy_benchmark"] = {"status": "not_run"}
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2), encoding="utf-8")

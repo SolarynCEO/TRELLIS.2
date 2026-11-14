@@ -34,58 +34,151 @@ def rasterize_uv_triangles(
     faces: torch.Tensor,
     texture_size: int | Sequence[int],
     eps: float = 1e-6,
+    face_chunk_size: Optional[int] = None,
+    max_candidates_per_chunk: Optional[int] = None,
 ) -> UVRasterization:
     height, width = _to_texture_hw(texture_size)
     device = uvs.device
     dtype = uvs.dtype
 
-    face_indices = torch.full((height, width), -1, dtype=torch.long, device=device)
-    barycentric = torch.zeros((height, width, 3), dtype=dtype, device=device)
+    if face_chunk_size is None:
+        face_chunk_size = 2048 if _is_truthy(os.environ.get("ZYREX_LOW_VRAM")) else 4096
+    if max_candidates_per_chunk is None:
+        max_candidates_per_chunk = 1_500_000 if _is_truthy(os.environ.get("ZYREX_LOW_VRAM")) else 4_000_000
+    face_chunk_size = max(int(face_chunk_size), 1)
+    max_candidates_per_chunk = max(int(max_candidates_per_chunk), 1)
 
-    uvs_px = uvs[:, :2].clone()
+    faces_long = faces.long()
+    uvs_px = uvs[:, :2].to(dtype=torch.float32).clone()
     uvs_px[:, 0] = uvs_px[:, 0] * (width - 1)
     uvs_px[:, 1] = uvs_px[:, 1] * (height - 1)
+    tris = uvs_px[faces_long]  # [F, 3, 2]
 
-    for face_id in range(faces.shape[0]):
-        face = faces[face_id]
-        tri = uvs_px[face]  # [3, 2]
+    num_pixels = height * width
+    best_face = torch.full((num_pixels,), -1, dtype=torch.long, device=device)
+    best_bary = torch.zeros((num_pixels, 3), dtype=dtype, device=device)
 
-        min_x = max(int(torch.floor(tri[:, 0].min()).item()), 0)
-        max_x = min(int(torch.ceil(tri[:, 0].max()).item()), width - 1)
-        min_y = max(int(torch.floor(tri[:, 1].min()).item()), 0)
-        max_y = min(int(torch.ceil(tri[:, 1].max()).item()), height - 1)
-        if min_x > max_x or min_y > max_y:
+    total_faces = tris.shape[0]
+    start = 0
+    while start < total_faces:
+        tentative_end = min(start + face_chunk_size, total_faces)
+        while True:
+            tri_chunk = tris[start:tentative_end]
+            min_x = torch.floor(torch.min(tri_chunk[..., 0], dim=1).values).long().clamp(0, width - 1)
+            max_x = torch.ceil(torch.max(tri_chunk[..., 0], dim=1).values).long().clamp(0, width - 1)
+            min_y = torch.floor(torch.min(tri_chunk[..., 1], dim=1).values).long().clamp(0, height - 1)
+            max_y = torch.ceil(torch.max(tri_chunk[..., 1], dim=1).values).long().clamp(0, height - 1)
+            widths = max_x - min_x + 1
+            heights = max_y - min_y + 1
+            valid_bbox = (widths > 0) & (heights > 0)
+            if not valid_bbox.any():
+                break
+            areas = widths[valid_bbox] * heights[valid_bbox]
+            num_candidates = int(areas.sum().item())
+            if num_candidates <= max_candidates_per_chunk or tentative_end - start <= 1:
+                break
+            tentative_end = start + max(1, (tentative_end - start) // 2)
+
+        tri_chunk = tris[start:tentative_end]
+        min_x = torch.floor(torch.min(tri_chunk[..., 0], dim=1).values).long().clamp(0, width - 1)
+        max_x = torch.ceil(torch.max(tri_chunk[..., 0], dim=1).values).long().clamp(0, width - 1)
+        min_y = torch.floor(torch.min(tri_chunk[..., 1], dim=1).values).long().clamp(0, height - 1)
+        max_y = torch.ceil(torch.max(tri_chunk[..., 1], dim=1).values).long().clamp(0, height - 1)
+        widths = max_x - min_x + 1
+        heights = max_y - min_y + 1
+        valid_bbox = (widths > 0) & (heights > 0)
+        if not valid_bbox.any():
+            start = tentative_end
             continue
 
-        x = torch.arange(min_x, max_x + 1, device=device, dtype=dtype) + 0.5
-        y = torch.arange(min_y, max_y + 1, device=device, dtype=dtype) + 0.5
-        yy, xx = torch.meshgrid(y, x, indexing="ij")
+        local_face_ids = torch.nonzero(valid_bbox, as_tuple=False).squeeze(1)
+        tri_valid = tri_chunk[local_face_ids]
+        min_x_v = min_x[local_face_ids]
+        min_y_v = min_y[local_face_ids]
+        widths_v = widths[local_face_ids]
+        heights_v = heights[local_face_ids]
+        areas_v = widths_v * heights_v
+        total_candidates = int(areas_v.sum().item())
+        if total_candidates == 0:
+            start = tentative_end
+            continue
 
-        ax, ay = tri[0, 0], tri[0, 1]
-        bx, by = tri[1, 0], tri[1, 1]
-        cx, cy = tri[2, 0], tri[2, 1]
+        compact_ids = torch.arange(local_face_ids.shape[0], device=device, dtype=torch.long)
+        compact_rep = torch.repeat_interleave(compact_ids, areas_v)
+        local_offsets = torch.cumsum(areas_v, dim=0) - areas_v
+        offsets_rep = torch.repeat_interleave(local_offsets, areas_v)
+        linear = torch.arange(total_candidates, device=device, dtype=torch.long) - offsets_rep
+        widths_rep = torch.repeat_interleave(widths_v, areas_v)
+
+        x_local = linear % widths_rep
+        y_local = torch.div(linear, widths_rep, rounding_mode="floor")
+        min_x_rep = torch.repeat_interleave(min_x_v, areas_v)
+        min_y_rep = torch.repeat_interleave(min_y_v, areas_v)
+        x_int = min_x_rep + x_local
+        y_int = min_y_rep + y_local
+        x = x_int.to(torch.float32) + 0.5
+        y = y_int.to(torch.float32) + 0.5
+
+        tri = tri_valid[compact_rep]
+        ax = tri[:, 0, 0]
+        ay = tri[:, 0, 1]
+        bx = tri[:, 1, 0]
+        by = tri[:, 1, 1]
+        cx = tri[:, 2, 0]
+        cy = tri[:, 2, 1]
         denom = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
-        if torch.abs(denom) < eps:
-            continue
-
-        w0 = ((by - cy) * (xx - cx) + (cx - bx) * (yy - cy)) / denom
-        w1 = ((cy - ay) * (xx - cx) + (ax - cx) * (yy - cy)) / denom
+        nondegenerate = torch.abs(denom) >= eps
+        safe_denom = torch.where(nondegenerate, denom, torch.ones_like(denom))
+        w0 = ((by - cy) * (x - cx) + (cx - bx) * (y - cy)) / safe_denom
+        w1 = ((cy - ay) * (x - cx) + (ax - cx) * (y - cy)) / safe_denom
         w2 = 1.0 - w0 - w1
-        inside = (w0 >= -eps) & (w1 >= -eps) & (w2 >= -eps)
+
+        inside = nondegenerate & (w0 >= -eps) & (w1 >= -eps) & (w2 >= -eps)
         if not inside.any():
+            start = tentative_end
             continue
 
-        region_faces = face_indices[min_y : max_y + 1, min_x : max_x + 1]
-        region_bary = barycentric[min_y : max_y + 1, min_x : max_x + 1]
-        write_mask = inside & (region_faces < 0)
-        if not write_mask.any():
+        compact_rep = compact_rep[inside]
+        pix_idx = y_int[inside] * width + x_int[inside]
+        face_idx = (start + local_face_ids[compact_rep]).long()
+        bary = torch.stack([w0[inside], w1[inside], w2[inside]], dim=-1).to(dtype=dtype)
+
+        unique_pix, inv = torch.unique(pix_idx, sorted=False, return_inverse=True)
+        if unique_pix.numel() == 0:
+            start = tentative_end
             continue
 
-        region_faces[write_mask] = face_id
-        region_bary[..., 0] = torch.where(write_mask, w0, region_bary[..., 0])
-        region_bary[..., 1] = torch.where(write_mask, w1, region_bary[..., 1])
-        region_bary[..., 2] = torch.where(write_mask, w2, region_bary[..., 2])
+        max_face = torch.iinfo(torch.long).max
+        min_face_per_u = torch.full((unique_pix.shape[0],), max_face, dtype=torch.long, device=device)
+        min_face_per_u.scatter_reduce_(0, inv, face_idx, reduce="amin", include_self=True)
 
+        cand_idx = torch.arange(face_idx.shape[0], device=device, dtype=torch.long)
+        large_idx = torch.full_like(cand_idx, cand_idx.shape[0])
+        is_best_face = face_idx == min_face_per_u[inv]
+        idx_for_u = torch.where(is_best_face, cand_idx, large_idx)
+        chosen_idx_per_u = torch.full((unique_pix.shape[0],), cand_idx.shape[0], dtype=torch.long, device=device)
+        chosen_idx_per_u.scatter_reduce_(0, inv, idx_for_u, reduce="amin", include_self=True)
+        valid_u = chosen_idx_per_u < cand_idx.shape[0]
+        if not valid_u.any():
+            start = tentative_end
+            continue
+
+        chosen_idx = chosen_idx_per_u[valid_u]
+        chosen_pix = unique_pix[valid_u]
+        chosen_face = face_idx[chosen_idx]
+        chosen_bary = bary[chosen_idx]
+
+        prev_face = best_face[chosen_pix]
+        better = (prev_face < 0) | (chosen_face < prev_face)
+        if better.any():
+            update_pix = chosen_pix[better]
+            best_face[update_pix] = chosen_face[better]
+            best_bary[update_pix] = chosen_bary[better]
+
+        start = tentative_end
+
+    face_indices = best_face.view(height, width)
+    barycentric = best_bary.view(height, width, 3)
     mask = face_indices >= 0
     return UVRasterization(mask=mask, face_indices=face_indices, barycentric=barycentric)
 
