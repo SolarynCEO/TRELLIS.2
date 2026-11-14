@@ -98,6 +98,28 @@ def main() -> None:
     )
     mesh = outputs[0]
     mesh.simplify(16_777_216)  # nvdiffrast face-limit guard
+    bake_args_meta = {
+        "decimation_target": int(args.decimation_target),
+        "texture_size": int(args.texture_size),
+        "remesh": True,
+        "remesh_band": 1,
+        "remesh_project": 0,
+    }
+    to_glb_kwargs = {
+        "vertices": mesh.vertices,
+        "faces": mesh.faces,
+        "attr_volume": mesh.attrs,
+        "coords": mesh.coords,
+        "attr_layout": mesh.layout,
+        "grid_size": int(round(1.0 / mesh.voxel_size)),
+        "aabb": [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+        "decimation_target": bake_args_meta["decimation_target"],
+        "texture_size": bake_args_meta["texture_size"],
+        "remesh": bake_args_meta["remesh"],
+        "remesh_band": bake_args_meta["remesh_band"],
+        "remesh_project": bake_args_meta["remesh_project"],
+        "use_tqdm": True,
+    }
     baker_input_path = None
     if args.dump_baker_input:
         if args.baker_input_path is not None:
@@ -118,32 +140,12 @@ def main() -> None:
             "aabb": np.array([[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]], dtype=np.float32),
             "voxel_size": np.array([mesh.voxel_size], dtype=np.float32),
             "grid_size": np.array([int(round(1.0 / mesh.voxel_size))] * 3, dtype=np.int32),
-            "attr_layout_json": np.array([json.dumps(layout_meta)], dtype=object),
-            "to_glb_args_json": np.array([json.dumps({
-                "decimation_target": int(args.decimation_target),
-                "texture_size": int(args.texture_size),
-                "remesh": True,
-                "remesh_band": 1,
-                "remesh_project": 0,
-            })], dtype=object),
+            "attr_layout_json": np.array([json.dumps(layout_meta)], dtype=np.str_),
+            "to_glb_args_json": np.array([json.dumps(bake_args_meta)], dtype=np.str_),
         }
         np.savez_compressed(str(baker_input_path), **np_payload)
 
-    glb = o_voxel.postprocess.to_glb(
-        vertices=mesh.vertices,
-        faces=mesh.faces,
-        attr_volume=mesh.attrs,
-        coords=mesh.coords,
-        attr_layout=mesh.layout,
-        grid_size=int(round(1.0 / mesh.voxel_size)),
-        aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-        decimation_target=args.decimation_target,
-        texture_size=args.texture_size,
-        remesh=True,
-        remesh_band=1,
-        remesh_project=0,
-        use_tqdm=True,
-    )
+    glb = o_voxel.postprocess.to_glb(**to_glb_kwargs)
     glb_path = output_dir / f"low_vram_benchmark_{ts}.glb"
     glb.export(str(glb_path), extension_webp=True)
     wall_total = time.perf_counter() - wall_start

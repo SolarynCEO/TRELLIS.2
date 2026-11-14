@@ -2,6 +2,7 @@ from typing import *
 import hashlib
 import os
 import time
+import warnings
 from tqdm import tqdm
 import numpy as np
 import torch
@@ -25,23 +26,15 @@ def _is_truthy(value: Optional[str]) -> bool:
     return value.strip().lower() not in {"", "0", "false", "no", "off"}
 
 
-def _resolve_zyrex_sample_chunk_size() -> int:
-    env_value = os.environ.get("ZYREX_BAKER_CHUNK_SIZE")
-    if env_value:
-        try:
-            parsed = int(env_value)
-            if parsed > 0:
-                return parsed
-        except ValueError:
-            pass
-    if _is_truthy(os.environ.get("ZYREX_LOW_VRAM")):
-        return 65536
-    return 262144
-
-
 def _resolve_emit_normal_map() -> bool:
-    # Keep production-compatible default behavior: no normal texture emitted.
-    return _is_truthy(os.environ.get("ZYREX_EMIT_NORMAL_MAP"))
+    emit = _is_truthy(os.environ.get("ZYREX_EMIT_NORMAL_MAP"))
+    if emit:
+        warnings.warn(
+            "ZYREX_EMIT_NORMAL_MAP=1 enables an experimental normal-map path that is not yet "
+            "validated for production tangent-space parity.",
+            stacklevel=2,
+        )
+    return emit
 
 
 def _normalize_volume_meta(
@@ -104,6 +97,7 @@ def prepare_glb_bake_inputs(
     mesh_cluster_smooth_strength=1,
     verbose: bool = False,
     progress_cb: Optional[Callable[[], None]] = None,
+    collect_debug: bool = False,
 ) -> Dict[str, Any]:
     vertices = vertices.cuda()
     faces = faces.cuda()
@@ -173,7 +167,7 @@ def prepare_glb_bake_inputs(
     if progress_cb is not None:
         progress_cb()
 
-    return {
+    out = {
         "mesh": mesh,
         "bvh": bvh,
         "source_vertices": src_vertices,
@@ -182,8 +176,10 @@ def prepare_glb_bake_inputs(
         "out_faces": out_faces,
         "out_uvs": out_uvs,
         "out_normals": out_normals,
-        "hashes": _hash_face_uv(out_faces, out_uvs),
     }
+    if collect_debug:
+        out["hashes"] = _hash_face_uv(out_faces, out_uvs)
+    return out
 
 
 def _bake_maps_nvdiffrast(
@@ -195,6 +191,7 @@ def _bake_maps_nvdiffrast(
     voxel_size: torch.Tensor,
     grid_size: torch.Tensor,
     texture_size: int,
+    collect_debug: bool = False,
 ) -> Dict[str, Any]:
     if dr is None:
         raise ImportError("nvdiffrast is required for ZYREX_BAKER=nvdiffrast but is not importable.")
@@ -226,7 +223,7 @@ def _bake_maps_nvdiffrast(
 
     timings["rasterize_uv"] = time.perf_counter() - t0
     t0 = time.perf_counter()
-    face_indices = rast[0, ..., 3].long() - 1
+    face_indices = rast[0, ..., 3].to(torch.int32) - 1
     mask = face_indices >= 0
     pos = dr.interpolate(out_vertices.unsqueeze(0), rast, out_faces)[0][0]
     valid_pos = pos[mask]
@@ -248,19 +245,14 @@ def _bake_maps_nvdiffrast(
     )
     timings["sample_attr_volume"] = time.perf_counter() - t0
     t0 = time.perf_counter()
-    pos_mapped = torch.zeros(texture_size, texture_size, 3, dtype=valid_pos.dtype, device=valid_pos.device)
-    pos_mapped[mask] = valid_pos
     mask_np = mask.cpu().numpy()
     base_color = np.clip(attrs[..., attr_layout["base_color"]].cpu().numpy() * 255, 0, 255).astype(np.uint8)
     metallic = np.clip(attrs[..., attr_layout["metallic"]].cpu().numpy() * 255, 0, 255).astype(np.uint8)
     roughness = np.clip(attrs[..., attr_layout["roughness"]].cpu().numpy() * 255, 0, 255).astype(np.uint8)
     alpha = np.clip(attrs[..., attr_layout["alpha"]].cpu().numpy() * 255, 0, 255).astype(np.uint8)
     timings["quantize_maps"] = time.perf_counter() - t0
-    return {
+    out = {
         "mask_raw": mask_np,
-        "face_indices_raw": face_indices.cpu().numpy().astype(np.int32),
-        "sample_positions_raw": pos_mapped.cpu().numpy().astype(np.float32),
-        "sampled_attrs_raw": attrs.cpu().numpy().astype(np.float32),
         "timings": timings,
         "maps_raw": {
             "base_color": base_color,
@@ -270,6 +262,13 @@ def _bake_maps_nvdiffrast(
             "normal": None,
         },
     }
+    if collect_debug:
+        pos_mapped = torch.zeros(texture_size, texture_size, 3, dtype=valid_pos.dtype, device=valid_pos.device)
+        pos_mapped[mask] = valid_pos
+        out["face_indices_raw"] = face_indices.cpu().numpy().astype(np.int32)
+        out["sample_positions_raw"] = pos_mapped.cpu().numpy().astype(np.float32)
+        out["sampled_attrs_raw"] = attrs.cpu().numpy().astype(np.float32)
+    return out
 
 
 def _bake_maps_zyrex(
@@ -282,6 +281,7 @@ def _bake_maps_zyrex(
     grid_size: torch.Tensor,
     texture_size: int,
     emit_normal_map: bool,
+    collect_debug: bool = False,
 ) -> Dict[str, Any]:
     from .zyrex_uv_baker import (
         bake_tangent_space_normal_map,
@@ -345,9 +345,6 @@ def _bake_maps_zyrex(
         )
         timings["bake_normal_map"] = time.perf_counter() - t0
     t0 = time.perf_counter()
-    pos_mapped = torch.zeros(texture_size, texture_size, 3, dtype=query_positions.dtype, device=query_positions.device)
-    pos_mapped[raster.mask] = query_positions
-
     mask_np = raster.mask.cpu().numpy()
     base_color = torch.clamp(attrs[..., attr_layout["base_color"]] * 255.0, 0.0, 255.0).byte().cpu().numpy()
     metallic = torch.clamp(attrs[..., attr_layout["metallic"]] * 255.0, 0.0, 255.0).byte().cpu().numpy()
@@ -357,11 +354,8 @@ def _bake_maps_zyrex(
     if normal is not None:
         normal_np = torch.clamp(normal * 255.0, 0.0, 255.0).byte().cpu().numpy()
     timings["quantize_maps"] = time.perf_counter() - t0
-    return {
+    out = {
         "mask_raw": mask_np,
-        "face_indices_raw": raster.face_indices.cpu().numpy().astype(np.int32),
-        "sample_positions_raw": pos_mapped.cpu().numpy().astype(np.float32),
-        "sampled_attrs_raw": attrs.cpu().numpy().astype(np.float32),
         "timings": timings,
         "rasterizer_stats": raster.stats,
         "maps_raw": {
@@ -372,6 +366,13 @@ def _bake_maps_zyrex(
             "normal": normal_np,
         },
     }
+    if collect_debug:
+        pos_mapped = torch.zeros(texture_size, texture_size, 3, dtype=query_positions.dtype, device=query_positions.device)
+        pos_mapped[raster.mask] = query_positions
+        out["face_indices_raw"] = raster.face_indices.cpu().numpy().astype(np.int32)
+        out["sample_positions_raw"] = pos_mapped.cpu().numpy().astype(np.float32)
+        out["sampled_attrs_raw"] = attrs.cpu().numpy().astype(np.float32)
+    return out
 
 
 def bake_glb_maps_from_prepared(
@@ -385,9 +386,20 @@ def bake_glb_maps_from_prepared(
     texture_size: int,
     backend: str,
     emit_normal_map: bool = False,
+    collect_debug: bool = False,
 ) -> Dict[str, Any]:
     if backend == "nvdiffrast":
-        baked = _bake_maps_nvdiffrast(prepared, attr_volume, coords, attr_layout, aabb, voxel_size, grid_size, texture_size)
+        baked = _bake_maps_nvdiffrast(
+            prepared,
+            attr_volume,
+            coords,
+            attr_layout,
+            aabb,
+            voxel_size,
+            grid_size,
+            texture_size,
+            collect_debug=collect_debug,
+        )
     elif backend == "zyrex":
         baked = _bake_maps_zyrex(
             prepared,
@@ -399,12 +411,10 @@ def bake_glb_maps_from_prepared(
             grid_size,
             texture_size,
             emit_normal_map=emit_normal_map,
+            collect_debug=collect_debug,
         )
     else:
-        raise NotImplementedError(
-            f"ZYREX_BAKER={backend!r} is reserved but not implemented. "
-            "Use ZYREX_BAKER=nvdiffrast (default) or ZYREX_BAKER=zyrex."
-        )
+        raise ValueError(f"Unsupported baker backend {backend!r}.")
 
     mask_raw = baked["mask_raw"]
     timings = dict(baked.get("timings", {}))
@@ -429,7 +439,7 @@ def bake_glb_maps_from_prepared(
     }
     return {
         "backend": backend,
-        "hashes": prepared["hashes"],
+        "hashes": prepared.get("hashes"),
         "mask_raw": mask_raw,
         "face_indices_raw": baked.get("face_indices_raw"),
         "sample_positions_raw": baked.get("sample_positions_raw"),
@@ -494,6 +504,13 @@ def to_glb(
         grid_size=grid_size,
         device=coords.device,
     )
+    backend = resolve_baker_backend()
+    if backend == "nvdiffrast" and dr is None:
+        raise ImportError(
+            "ZYREX_BAKER is set to 'nvdiffrast' (default), but nvdiffrast could not be imported. "
+            "Install/build nvdiffrast or set ZYREX_BAKER=zyrex."
+        )
+    emit_normal_map = _resolve_emit_normal_map()
     
     if use_tqdm:
         pbar = tqdm(total=6, desc="Extracting GLB")
@@ -517,6 +534,7 @@ def to_glb(
         mesh_cluster_smooth_strength=mesh_cluster_smooth_strength,
         verbose=verbose,
         progress_cb=(lambda: pbar.update(1)) if use_tqdm else None,
+        collect_debug=return_debug,
     )
     
     # --- Texture Baking (Attribute Sampling) ---
@@ -524,17 +542,6 @@ def to_glb(
         pbar.set_description("Sampling attributes")
     if verbose:
         print("Sampling attributes...", end='', flush=True)
-    backend = resolve_baker_backend()
-    if backend == "nvdiffrast" and dr is None:
-        raise ImportError(
-            "ZYREX_BAKER is set to 'nvdiffrast' (default), but nvdiffrast could not be imported. "
-            "Install/build nvdiffrast or set ZYREX_BAKER=zyrex."
-        )
-    if backend in ("pytorch3d", "kaolin"):
-        raise NotImplementedError(
-            f"ZYREX_BAKER={backend!r} is reserved but not implemented. "
-            "Use ZYREX_BAKER=nvdiffrast (default) or ZYREX_BAKER=zyrex."
-        )
 
     baked = bake_glb_maps_from_prepared(
         prepared=prepared,
@@ -546,7 +553,8 @@ def to_glb(
         grid_size=grid_size,
         texture_size=texture_size,
         backend=backend,
-        emit_normal_map=_resolve_emit_normal_map(),
+        emit_normal_map=emit_normal_map,
+        collect_debug=return_debug,
     )
     if use_tqdm:
         pbar.update(1)
@@ -619,7 +627,7 @@ def to_glb(
         return textured_mesh
     debug = {
         "backend": backend,
-        "hashes": prepared["hashes"],
+        "hashes": prepared.get("hashes"),
         "mask_raw": mask_raw,
         "maps_raw": maps_raw,
         "maps_filled": maps_filled,

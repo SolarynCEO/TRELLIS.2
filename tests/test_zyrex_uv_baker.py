@@ -203,7 +203,7 @@ def test_uv_rasterization_matches_nvdiffrast_mask_and_face_ids():
     # Accept face-id differences only for genuine edge ties:
     #  - faces must share an edge (adjacent),
     #  - texel center must lie on that shared edge at 8-bit subpixel precision
-    #    (|edge function| <= 1), or UV reconstructed from both faces agrees.
+    #    (|edge function| <= 1).
     uvs_fp = torch.floor((uvs.cpu() * texture_size - 0.5) * 256.0 + 0.5).to(torch.int64)
     faces_cpu = faces.cpu().to(torch.long)
     face_coords = torch.nonzero(face_diff, as_tuple=False)
@@ -227,27 +227,6 @@ def test_uv_rasterization_matches_nvdiffrast_mask_and_face_ids():
             edge_abs = abs((xfp - ax) * (by - ay) - (yfp - ay) * (bx - ax))
             if edge_abs <= 1:
                 tie_ok = True
-            else:
-                p = torch.tensor([(cc + 0.5) / texture_size, (rr + 0.5) / texture_size], dtype=torch.float32)
-
-                def interp_uv(face_idx: int) -> torch.Tensor:
-                    tri = uvs.cpu()[faces_cpu[face_idx], :2]
-                    v0, v1, v2 = tri[0], tri[1], tri[2]
-                    area = (v1[0] - v0[0]) * (v2[1] - v0[1]) - (v1[1] - v0[1]) * (v2[0] - v0[0])
-                    if abs(float(area)) < 1e-12:
-                        return tri.mean(dim=0)
-                    e0f = (p[0] - v1[0]) * (v2[1] - v1[1]) - (p[1] - v1[1]) * (v2[0] - v1[0])
-                    e1f = (p[0] - v2[0]) * (v0[1] - v2[1]) - (p[1] - v2[1]) * (v0[0] - v2[0])
-                    e2f = (p[0] - v0[0]) * (v1[1] - v0[1]) - (p[1] - v0[1]) * (v1[0] - v0[0])
-                    w0 = -e0f / area
-                    w1 = -e1f / area
-                    w2 = -e2f / area
-                    return w0 * v0 + w1 * v1 + w2 * v2
-
-                uv_a = interp_uv(fa)
-                uv_b = interp_uv(fb)
-                if float(torch.linalg.norm(uv_a - uv_b).item()) <= 1e-4:
-                    tie_ok = True
         item = (rr, cc, fa, fb)
         if tie_ok:
             explained.append(item)
@@ -336,7 +315,9 @@ def test_uv_rasterization_triton_matches_torch(monkeypatch):
     monkeypatch.setenv("ZYREX_RASTER_IMPL", "torch")
     raster_torch = rasterize_uv_triangles(uvs, faces, tex)
     monkeypatch.setenv("ZYREX_RASTER_IMPL", "triton")
+    assert _UV_MODULE._resolve_raster_impl(device) == "triton"
     raster_triton = rasterize_uv_triangles(uvs, faces, tex)
+    assert raster_triton.stats is not None, "Expected Triton rasterizer stats when Triton path is active."
     assert torch.equal(raster_torch.mask, raster_triton.mask)
     assert torch.equal(raster_torch.face_indices[raster_torch.mask], raster_triton.face_indices[raster_triton.mask])
 
@@ -453,6 +434,8 @@ os.environ["ZYREX_RASTER_IMPL"] = "triton"
 raster_triton = mod.rasterize_uv_triangles(uvs, faces, tex)
 
 payload = {{
+    "resolved_impl": mod._resolve_raster_impl(torch.device("cpu")),
+    "triton_stats_present": raster_triton.stats is not None,
     "mask_equal": bool(torch.equal(raster_torch.mask, raster_triton.mask)),
     "face_equal": bool(torch.equal(
         raster_torch.face_indices[raster_torch.mask],
@@ -466,8 +449,133 @@ print(json.dumps(payload))
     proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, env=env)
     assert proc.returncode == 0, proc.stderr
     payload = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert payload["resolved_impl"] == "triton"
+    assert payload["triton_stats_present"]
     assert payload["mask_equal"]
     assert payload["face_equal"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for real export-path parity test")
+def test_bake_glb_maps_from_prepared_zyrex_matches_nvdiffrast_tiny():
+    pytest.importorskip("nvdiffrast.torch")
+    postprocess_path = ROOT / "o-voxel" / "o_voxel" / "postprocess.py"
+    post_spec = importlib.util.spec_from_file_location("zyrex_postprocess_test_impl", postprocess_path)
+    if post_spec is None or post_spec.loader is None:
+        pytest.skip(f"Failed to load postprocess module from {postprocess_path}")
+    post_module = importlib.util.module_from_spec(post_spec)
+    sys.modules[post_spec.name] = post_module
+    try:
+        post_spec.loader.exec_module(post_module)
+    except Exception as exc:
+        pytest.skip(f"Postprocess module dependencies unavailable for this environment: {exc}")
+
+    device = torch.device("cuda")
+    out_vertices = torch.tensor(
+        [[0.0, 0.0, 0.5], [1.0, 0.0, 0.5], [0.0, 1.0, 0.5]],
+        dtype=torch.float32,
+        device=device,
+    )
+    out_faces = torch.tensor([[0, 1, 2]], dtype=torch.long, device=device)
+    out_uvs = torch.tensor(
+        [[0.05, 0.05], [0.95, 0.05], [0.05, 0.95]],
+        dtype=torch.float32,
+        device=device,
+    )
+    out_normals = torch.tensor([[0.0, 0.0, 1.0]] * 3, dtype=torch.float32, device=device)
+    source_vertices = out_vertices.clone()
+    source_faces = out_faces.clone()
+
+    class _DummyBVH:
+        @staticmethod
+        def unsigned_distance(query_positions: torch.Tensor, return_uvw: bool = True):
+            x = query_positions[:, 0]
+            y = query_positions[:, 1]
+            uvw = torch.stack([1.0 - x - y, x, y], dim=-1)
+            face_id = torch.zeros((query_positions.shape[0],), dtype=torch.int64, device=query_positions.device)
+            dist = torch.zeros((query_positions.shape[0],), dtype=query_positions.dtype, device=query_positions.device)
+            return dist, face_id, uvw
+
+    prepared = {
+        "out_vertices": out_vertices,
+        "out_faces": out_faces,
+        "out_uvs": out_uvs,
+        "out_normals": out_normals,
+        "source_vertices": source_vertices,
+        "source_faces": source_faces,
+        "bvh": _DummyBVH(),
+    }
+
+    grid_res = 8
+    gx, gy, gz = torch.meshgrid(
+        torch.arange(grid_res, dtype=torch.int32, device=device),
+        torch.arange(grid_res, dtype=torch.int32, device=device),
+        torch.arange(grid_res, dtype=torch.int32, device=device),
+        indexing="ij",
+    )
+    coords = torch.stack([gx, gy, gz], dim=-1).reshape(-1, 3)
+    xyz = coords.float() / float(grid_res - 1)
+    attr_volume = torch.cat(
+        [
+            xyz,
+            (0.2 + 0.5 * xyz[:, 0:1]),
+            (0.3 + 0.4 * xyz[:, 1:2]),
+            torch.ones_like(xyz[:, 0:1]),
+        ],
+        dim=-1,
+    ).to(torch.float32)
+    attr_layout = {
+        "base_color": slice(0, 3),
+        "metallic": slice(3, 4),
+        "roughness": slice(4, 5),
+        "alpha": slice(5, 6),
+    }
+    aabb = torch.tensor([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]], dtype=torch.float32, device=device)
+    grid_size = torch.tensor([grid_res, grid_res, grid_res], dtype=torch.int32, device=device)
+    voxel_size = torch.tensor([1.0 / (grid_res - 1)] * 3, dtype=torch.float32, device=device)
+    tex = 64
+
+    baked_nvd = post_module.bake_glb_maps_from_prepared(
+        prepared=prepared,
+        attr_volume=attr_volume,
+        coords=coords,
+        attr_layout=attr_layout,
+        aabb=aabb,
+        voxel_size=voxel_size,
+        grid_size=grid_size,
+        texture_size=tex,
+        backend="nvdiffrast",
+        collect_debug=True,
+    )
+    baked_zyx = post_module.bake_glb_maps_from_prepared(
+        prepared=prepared,
+        attr_volume=attr_volume,
+        coords=coords,
+        attr_layout=attr_layout,
+        aabb=aabb,
+        voxel_size=voxel_size,
+        grid_size=grid_size,
+        texture_size=tex,
+        backend="zyrex",
+        collect_debug=True,
+    )
+
+    mask_nvd = baked_nvd["mask_raw"].astype(bool)
+    mask_zyx = baked_zyx["mask_raw"].astype(bool)
+    xor_ratio = float(np.logical_xor(mask_nvd, mask_zyx).mean())
+    assert xor_ratio <= 0.01
+    overlap = mask_nvd & mask_zyx
+    assert overlap.any()
+
+    for key, min_psnr in (
+        ("base_color", 35.0),
+        ("metallic", 35.0),
+        ("roughness", 35.0),
+        ("alpha", 60.0),
+    ):
+        ref = baked_nvd["maps_filled"][key].astype(np.float32) / 255.0
+        pred = baked_zyx["maps_filled"][key].astype(np.float32) / 255.0
+        psnr_val = _psnr(pred[overlap].reshape(-1), ref[overlap].reshape(-1))
+        assert psnr_val >= min_psnr, f"{key} PSNR too low: {psnr_val}"
 
 
 def _analytic_attr(pos: torch.Tensor) -> dict[str, torch.Tensor]:

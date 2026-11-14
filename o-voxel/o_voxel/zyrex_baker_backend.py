@@ -4,7 +4,7 @@ import os
 import warnings
 
 
-SUPPORTED_BAKER_BACKENDS = ("nvdiffrast", "pytorch3d", "kaolin", "zyrex")
+SUPPORTED_BAKER_BACKENDS = ("nvdiffrast", "zyrex")
 DEFAULT_BAKER_BACKEND = "nvdiffrast"
 
 

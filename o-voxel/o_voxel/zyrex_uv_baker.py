@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 import time
+import warnings
 from typing import Callable, Dict, Optional, Sequence, Tuple
 
 import torch
@@ -55,6 +56,11 @@ def _resolve_raster_impl(device: torch.device) -> str:
     requested = os.environ.get("ZYREX_RASTER_IMPL", "").strip().lower()
     if requested in {"torch", "triton"}:
         if requested == "triton" and not _triton_supported():
+            warnings.warn(
+                "ZYREX_RASTER_IMPL=triton was requested but Triton is unavailable for this device/runtime; "
+                "falling back to torch.",
+                stacklevel=2,
+            )
             return "torch"
         return requested
     # Keep the production-safe path as the default until explicit parity is proven.
@@ -118,7 +124,7 @@ def _rasterize_uv_triangles_torch(
     uvs_px[:, 0] = uvs_px[:, 0] * width - 0.5
     uvs_px[:, 1] = uvs_px[:, 1] * height - 0.5
     tris = uvs_px[faces_long]  # [F, 3, 2]
-    # nvdiffrast-style fixed-point snapping in screen space (8 subpixel bits).
+    # Standard fixed-point raster precision: 8 subpixel bits.
     tris_fp = torch.floor(tris * subpixel_scale + 0.5).to(torch.int64)
 
     num_pixels = height * width
@@ -218,7 +224,6 @@ def _rasterize_uv_triangles_torch(
         e2 = (x - v0[:, 0]) * (v1[:, 1] - v0[:, 1]) - (y - v0[:, 1]) * (v1[:, 0] - v0[:, 0])
 
         # Screen-space top-left convention in y-up image coordinates.
-        # nvdiffrast's raster output has row 0 at low clip-space Y.
         def edge_top_left(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
             dx = b[:, 0] - a[:, 0]
             dy = b[:, 1] - a[:, 1]
@@ -234,8 +239,8 @@ def _rasterize_uv_triangles_torch(
             & ((e1 < 0) | ((e1 == 0) & (~tl1)))
             & ((e2 < 0) | ((e2 == 0) & (~tl2)))
         )
-        inside_count = int(inside.sum().item())
-        stats["inside_count_total"] += inside_count
+        if profiling_enabled:
+            stats["inside_count_total"] += int(inside.sum().item())
         _stop_timer("edge_eval", t)
         if not inside.any():
             start = tentative_end
@@ -560,18 +565,14 @@ def rasterize_uv_triangles(
 ) -> UVRasterization:
     impl = _resolve_raster_impl(uvs.device)
     if impl == "triton":
-        try:
-            return _rasterize_uv_triangles_triton(
-                uvs=uvs,
-                faces=faces,
-                texture_size=texture_size,
-                eps=eps,
-                face_chunk_size=face_chunk_size,
-                max_candidates_per_chunk=max_candidates_per_chunk,
-            )
-        except Exception:
-            if os.environ.get("ZYREX_RASTER_IMPL", "").strip().lower() == "triton":
-                raise
+        return _rasterize_uv_triangles_triton(
+            uvs=uvs,
+            faces=faces,
+            texture_size=texture_size,
+            eps=eps,
+            face_chunk_size=face_chunk_size,
+            max_candidates_per_chunk=max_candidates_per_chunk,
+        )
     return _rasterize_uv_triangles_torch(
         uvs=uvs,
         faces=faces,

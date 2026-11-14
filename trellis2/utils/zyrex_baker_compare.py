@@ -393,7 +393,7 @@ def _save_float_heat_png(values: np.ndarray, out_path: Path, valid_mask: Optiona
 
 
 def _load_voxel_input(npz_path: Path) -> Dict[str, object]:
-    data = np.load(npz_path, allow_pickle=True)
+    data = np.load(npz_path, allow_pickle=False)
     layout_json = str(data["attr_layout_json"][0])
     layout_obj = json.loads(layout_json)
     attr_layout = {k: slice(int(v[0]), int(v[1])) for k, v in layout_obj.items()}
@@ -843,105 +843,106 @@ def run_gpu_comparison_voxel_input(
     import o_voxel
     old_raster_profile = os.environ.get("ZYREX_RASTER_PROFILE")
     os.environ["ZYREX_RASTER_PROFILE"] = "1"
-
-    to_glb_args = dict(voxel["to_glb_args"])
-    decimation_target = int(to_glb_args.get("decimation_target", 500000))
-    texture_size = int(to_glb_args.get("texture_size", 2048))
-    remesh = bool(to_glb_args.get("remesh", True))
-    remesh_band = float(to_glb_args.get("remesh_band", 1))
-    remesh_project = float(to_glb_args.get("remesh_project", 0))
-    mesh_cluster_threshold_cone_half_angle_rad = float(
-        to_glb_args.get("mesh_cluster_threshold_cone_half_angle_rad", np.radians(90.0))
-    )
-    mesh_cluster_refine_iterations = int(to_glb_args.get("mesh_cluster_refine_iterations", 0))
-    mesh_cluster_global_iterations = int(to_glb_args.get("mesh_cluster_global_iterations", 1))
-    mesh_cluster_smooth_strength = float(to_glb_args.get("mesh_cluster_smooth_strength", 1))
-
-    vertices = voxel["vertices"].cuda()
-    faces = voxel["faces"].cuda().to(torch.int32)
-    attr_volume = voxel["attrs"].cuda()
-    coords = voxel["coords"].cuda().to(torch.int32)
-    aabb = voxel["aabb"].cuda()
-    grid_size = voxel["grid_size"].cuda().to(torch.int32)
-    voxel_size = voxel["voxel_size"].cuda()
-    attr_layout = voxel["attr_layout"]
-
-    _progress("gpu_voxel: shared mesh+UV preparation start", started)
-    prep_t0 = time.perf_counter()
-    prep = o_voxel.postprocess.prepare_glb_bake_inputs(
-        vertices=vertices,
-        faces=faces,
-        aabb=aabb,
-        grid_size=grid_size,
-        decimation_target=decimation_target,
-        remesh=remesh,
-        remesh_band=remesh_band,
-        remesh_project=remesh_project,
-        mesh_cluster_threshold_cone_half_angle_rad=mesh_cluster_threshold_cone_half_angle_rad,
-        mesh_cluster_refine_iterations=mesh_cluster_refine_iterations,
-        mesh_cluster_global_iterations=mesh_cluster_global_iterations,
-        mesh_cluster_smooth_strength=mesh_cluster_smooth_strength,
-        verbose=False,
-    )
-    prep_time = time.perf_counter() - prep_t0
-    _progress("gpu_voxel: shared mesh+UV preparation done", started)
-
-    def _run_voxel_backend(backend: str) -> Dict[str, object]:
-        def bake_once() -> Dict[str, object]:
-            return o_voxel.postprocess.bake_glb_maps_from_prepared(
-                prepared=prep,
-                attr_volume=attr_volume,
-                coords=coords,
-                attr_layout=attr_layout,
-                aabb=aabb,
-                voxel_size=voxel_size,
-                grid_size=grid_size,
-                texture_size=texture_size,
-                backend=backend,
-            )
-
-        _progress(f"gpu_voxel: {backend} warmup", started)
-        torch.cuda.synchronize()
-        _ = bake_once()
-        torch.cuda.synchronize()
-
-        times: list[float] = []
-        allocs: list[float] = []
-        reserveds: list[float] = []
-        stage_runs: list[Dict[str, float]] = []
-        bakes = []
-        for run_idx in range(3):
-            _progress(f"gpu_voxel: {backend} measured run {run_idx + 1}/3", started)
-            torch.cuda.synchronize()
-            torch.cuda.reset_peak_memory_stats()
-            t0 = time.perf_counter()
-            baked = bake_once()
-            torch.cuda.synchronize()
-            times.append(time.perf_counter() - t0)
-            allocs.append(float(torch.cuda.max_memory_allocated() / (1024**2)))
-            reserveds.append(float(torch.cuda.max_memory_reserved() / (1024**2)))
-            stage_runs.append({k: float(v) for k, v in baked.get("timings", {}).items()})
-            bakes.append(baked)
-
-        median_idx = int(np.argsort(np.array(times))[1])
-        stage_keys = sorted({k for run in stage_runs for k in run.keys()})
-        stage_medians = {
-            key: float(np.median(np.array([run.get(key, 0.0) for run in stage_runs], dtype=np.float64)))
-            for key in stage_keys
-        }
-        return {
-            "debug": bakes[median_idx],
-            "times": times,
-            "allocs": allocs,
-            "reserveds": reserveds,
-            "stage_runs": stage_runs,
-            "stage_medians": stage_medians,
-            "median_time": float(np.median(np.array(times))),
-            "median_alloc": float(np.median(np.array(allocs))),
-            "median_reserved": float(np.median(np.array(reserveds))),
-        }
-
     try:
+        to_glb_args = dict(voxel["to_glb_args"])
+        decimation_target = int(to_glb_args.get("decimation_target", 500000))
+        texture_size = int(to_glb_args.get("texture_size", 2048))
+        remesh = bool(to_glb_args.get("remesh", True))
+        remesh_band = float(to_glb_args.get("remesh_band", 1))
+        remesh_project = float(to_glb_args.get("remesh_project", 0))
+        mesh_cluster_threshold_cone_half_angle_rad = float(
+            to_glb_args.get("mesh_cluster_threshold_cone_half_angle_rad", np.radians(90.0))
+        )
+        mesh_cluster_refine_iterations = int(to_glb_args.get("mesh_cluster_refine_iterations", 0))
+        mesh_cluster_global_iterations = int(to_glb_args.get("mesh_cluster_global_iterations", 1))
+        mesh_cluster_smooth_strength = float(to_glb_args.get("mesh_cluster_smooth_strength", 1))
+
+        vertices = voxel["vertices"].cuda()
+        faces = voxel["faces"].cuda().to(torch.int32)
+        attr_volume = voxel["attrs"].cuda()
+        coords = voxel["coords"].cuda().to(torch.int32)
+        aabb = voxel["aabb"].cuda()
+        grid_size = voxel["grid_size"].cuda().to(torch.int32)
+        voxel_size = voxel["voxel_size"].cuda()
+        attr_layout = voxel["attr_layout"]
+
+        _progress("gpu_voxel: shared mesh+UV preparation start", started)
+        prep_t0 = time.perf_counter()
+        prep = o_voxel.postprocess.prepare_glb_bake_inputs(
+            vertices=vertices,
+            faces=faces,
+            aabb=aabb,
+            grid_size=grid_size,
+            decimation_target=decimation_target,
+            remesh=remesh,
+            remesh_band=remesh_band,
+            remesh_project=remesh_project,
+            mesh_cluster_threshold_cone_half_angle_rad=mesh_cluster_threshold_cone_half_angle_rad,
+            mesh_cluster_refine_iterations=mesh_cluster_refine_iterations,
+            mesh_cluster_global_iterations=mesh_cluster_global_iterations,
+            mesh_cluster_smooth_strength=mesh_cluster_smooth_strength,
+            verbose=False,
+            collect_debug=True,
+        )
+        prep_time = time.perf_counter() - prep_t0
+        _progress("gpu_voxel: shared mesh+UV preparation done", started)
+
+        def _run_voxel_backend(backend: str) -> Dict[str, object]:
+            def bake_once() -> Dict[str, object]:
+                return o_voxel.postprocess.bake_glb_maps_from_prepared(
+                    prepared=prep,
+                    attr_volume=attr_volume,
+                    coords=coords,
+                    attr_layout=attr_layout,
+                    aabb=aabb,
+                    voxel_size=voxel_size,
+                    grid_size=grid_size,
+                    texture_size=texture_size,
+                    backend=backend,
+                    collect_debug=True,
+                )
+
+            _progress(f"gpu_voxel: {backend} warmup", started)
+            torch.cuda.synchronize()
+            _ = bake_once()
+            torch.cuda.synchronize()
+
+            times: list[float] = []
+            allocs: list[float] = []
+            reserveds: list[float] = []
+            stage_runs: list[Dict[str, float]] = []
+            bakes = []
+            for run_idx in range(3):
+                _progress(f"gpu_voxel: {backend} measured run {run_idx + 1}/3", started)
+                torch.cuda.synchronize()
+                torch.cuda.reset_peak_memory_stats()
+                t0 = time.perf_counter()
+                baked = bake_once()
+                torch.cuda.synchronize()
+                times.append(time.perf_counter() - t0)
+                allocs.append(float(torch.cuda.max_memory_allocated() / (1024**2)))
+                reserveds.append(float(torch.cuda.max_memory_reserved() / (1024**2)))
+                stage_runs.append({k: float(v) for k, v in baked.get("timings", {}).items()})
+                bakes.append(baked)
+
+            median_idx = int(np.argsort(np.array(times))[1])
+            stage_keys = sorted({k for run in stage_runs for k in run.keys()})
+            stage_medians = {
+                key: float(np.median(np.array([run.get(key, 0.0) for run in stage_runs], dtype=np.float64)))
+                for key in stage_keys
+            }
+            return {
+                "debug": bakes[median_idx],
+                "times": times,
+                "allocs": allocs,
+                "reserveds": reserveds,
+                "stage_runs": stage_runs,
+                "stage_medians": stage_medians,
+                "median_time": float(np.median(np.array(times))),
+                "median_alloc": float(np.median(np.array(allocs))),
+                "median_reserved": float(np.median(np.array(reserveds))),
+            }
+
         nvd_runs = _run_voxel_backend("nvdiffrast")
         zyx_runs = _run_voxel_backend("zyrex")
         nvd_dbg = nvd_runs["debug"]
@@ -1295,26 +1296,28 @@ def main() -> None:
     if args.gpu_artifacts_dir is None:
         args.gpu_artifacts_dir = args.output.parent / f"{args.output.stem}_artifacts"
 
-    gpu_comparison = run_gpu_comparison(args.texture_size) if args.run_gpu else {
-        "status": "pending GPU run",
-        "reason": "Run again with --run-gpu on a CUDA machine with nvdiffrast installed.",
-        "map_metrics": "pending GPU run",
-        "rendered_view_metrics": "pending GPU run",
-        "processing_time_seconds": "pending GPU run",
-        "gpu_memory_mb": "pending GPU run",
-    }
-    if args.run_gpu:
-        if args.voxel_input is not None:
-            gpu_comparison = run_gpu_comparison_voxel_input(
-                voxel_input_path=args.voxel_input,
-                output_dir=args.gpu_artifacts_dir,
-            )
-        elif args.real_asset is not None:
-            gpu_comparison = run_gpu_comparison_real_asset(
-                glb_path=args.real_asset,
-                texture_size=args.texture_size,
-                output_dir=args.gpu_artifacts_dir,
-            )
+    if not args.run_gpu:
+        gpu_comparison = {
+            "status": "pending GPU run",
+            "reason": "Run again with --run-gpu on a CUDA machine with nvdiffrast installed.",
+            "map_metrics": "pending GPU run",
+            "rendered_view_metrics": "pending GPU run",
+            "processing_time_seconds": "pending GPU run",
+            "gpu_memory_mb": "pending GPU run",
+        }
+    elif args.voxel_input is not None:
+        gpu_comparison = run_gpu_comparison_voxel_input(
+            voxel_input_path=args.voxel_input,
+            output_dir=args.gpu_artifacts_dir,
+        )
+    elif args.real_asset is not None:
+        gpu_comparison = run_gpu_comparison_real_asset(
+            glb_path=args.real_asset,
+            texture_size=args.texture_size,
+            output_dir=args.gpu_artifacts_dir,
+        )
+    else:
+        gpu_comparison = run_gpu_comparison(args.texture_size)
 
     report: Dict[str, object] = {
         "hardware": {
