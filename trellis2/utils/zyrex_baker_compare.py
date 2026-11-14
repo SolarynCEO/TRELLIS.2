@@ -29,9 +29,6 @@ except Exception:  # pragma: no cover - optional fallback
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-O_VOXEL_ROOT = ROOT / "o-voxel"
-if str(O_VOXEL_ROOT) not in sys.path:
-    sys.path.insert(0, str(O_VOXEL_ROOT))
 _ZYREX_UV_BAKER_PATH = ROOT / "o-voxel" / "o_voxel" / "zyrex_uv_baker.py"
 _ZYREX_SPEC = importlib.util.spec_from_file_location("zyrex_uv_baker_compare_impl", _ZYREX_UV_BAKER_PATH)
 if _ZYREX_SPEC is None or _ZYREX_SPEC.loader is None:
@@ -383,11 +380,11 @@ def _load_voxel_input(npz_path: Path) -> Dict[str, object]:
         to_glb_args = json.loads(str(data["to_glb_args_json"][0]))
     return {
         "vertices": torch.from_numpy(data["vertices"]).float(),
-        "faces": torch.from_numpy(data["faces"]).long(),
+        "faces": torch.from_numpy(data["faces"]).to(torch.int32),
         "attrs": torch.from_numpy(data["attrs"]).float(),
-        "coords": torch.from_numpy(data["coords"]).int(),
+        "coords": torch.from_numpy(data["coords"]).to(torch.int32),
         "aabb": torch.from_numpy(data["aabb"]).float(),
-        "grid_size": torch.from_numpy(data["grid_size"]).int(),
+        "grid_size": torch.from_numpy(data["grid_size"]).to(torch.int32),
         "voxel_size": torch.from_numpy(data["voxel_size"]).float(),
         "attr_layout": attr_layout,
         "to_glb_args": to_glb_args,
@@ -795,51 +792,96 @@ def run_gpu_comparison_voxel_input(
     voxel = _load_voxel_input(voxel_input_path)
     import o_voxel
 
-    args = {
-        "vertices": voxel["vertices"].cuda(),
-        "faces": voxel["faces"].cuda(),
-        "attr_volume": voxel["attrs"].cuda(),
-        "coords": voxel["coords"].cuda(),
-        "attr_layout": voxel["attr_layout"],
-        "aabb": voxel["aabb"].cuda(),
-        "grid_size": voxel["grid_size"].cuda(),
-    }
-    args.update(voxel["to_glb_args"])
-    args.setdefault("decimation_target", 500000)
-    args.setdefault("texture_size", 2048)
-    args.setdefault("remesh", True)
-    args.setdefault("remesh_band", 1)
-    args.setdefault("remesh_project", 0)
-    args.setdefault("use_tqdm", False)
+    to_glb_args = dict(voxel["to_glb_args"])
+    decimation_target = int(to_glb_args.get("decimation_target", 500000))
+    texture_size = int(to_glb_args.get("texture_size", 2048))
+    remesh = bool(to_glb_args.get("remesh", True))
+    remesh_band = float(to_glb_args.get("remesh_band", 1))
+    remesh_project = float(to_glb_args.get("remesh_project", 0))
+    mesh_cluster_threshold_cone_half_angle_rad = float(
+        to_glb_args.get("mesh_cluster_threshold_cone_half_angle_rad", np.radians(90.0))
+    )
+    mesh_cluster_refine_iterations = int(to_glb_args.get("mesh_cluster_refine_iterations", 0))
+    mesh_cluster_global_iterations = int(to_glb_args.get("mesh_cluster_global_iterations", 1))
+    mesh_cluster_smooth_strength = float(to_glb_args.get("mesh_cluster_smooth_strength", 1))
 
-    old_backend = os.environ.get("ZYREX_BAKER")
-    try:
-        os.environ["ZYREX_BAKER"] = "nvdiffrast"
-        _progress("gpu_voxel: nvdiffrast to_glb start", started)
-        torch.cuda.synchronize()
-        torch.cuda.reset_peak_memory_stats()
-        t0 = time.perf_counter()
-        _, nvd_dbg = o_voxel.postprocess.to_glb(return_debug=True, **args)
-        torch.cuda.synchronize()
-        nvd_time = time.perf_counter() - t0
-        nvd_alloc_mb = torch.cuda.max_memory_allocated() / (1024**2)
-        nvd_reserved_mb = torch.cuda.max_memory_reserved() / (1024**2)
+    vertices = voxel["vertices"].cuda()
+    faces = voxel["faces"].cuda().to(torch.int32)
+    attr_volume = voxel["attrs"].cuda()
+    coords = voxel["coords"].cuda().to(torch.int32)
+    aabb = voxel["aabb"].cuda()
+    grid_size = voxel["grid_size"].cuda().to(torch.int32)
+    voxel_size = voxel["voxel_size"].cuda()
+    attr_layout = voxel["attr_layout"]
 
-        os.environ["ZYREX_BAKER"] = "zyrex"
-        _progress("gpu_voxel: zyrex to_glb start", started)
-        torch.cuda.synchronize()
-        torch.cuda.reset_peak_memory_stats()
-        t1 = time.perf_counter()
-        _, zyx_dbg = o_voxel.postprocess.to_glb(return_debug=True, **args)
-        torch.cuda.synchronize()
-        zyx_time = time.perf_counter() - t1
-        zyx_alloc_mb = torch.cuda.max_memory_allocated() / (1024**2)
-        zyx_reserved_mb = torch.cuda.max_memory_reserved() / (1024**2)
-    finally:
-        if old_backend is None:
-            os.environ.pop("ZYREX_BAKER", None)
-        else:
-            os.environ["ZYREX_BAKER"] = old_backend
+    _progress("gpu_voxel: shared mesh+UV preparation start", started)
+    prep_t0 = time.perf_counter()
+    prep = o_voxel.postprocess.prepare_glb_bake_inputs(
+        vertices=vertices,
+        faces=faces,
+        aabb=aabb,
+        grid_size=grid_size,
+        decimation_target=decimation_target,
+        remesh=remesh,
+        remesh_band=remesh_band,
+        remesh_project=remesh_project,
+        mesh_cluster_threshold_cone_half_angle_rad=mesh_cluster_threshold_cone_half_angle_rad,
+        mesh_cluster_refine_iterations=mesh_cluster_refine_iterations,
+        mesh_cluster_global_iterations=mesh_cluster_global_iterations,
+        mesh_cluster_smooth_strength=mesh_cluster_smooth_strength,
+        verbose=False,
+    )
+    prep_time = time.perf_counter() - prep_t0
+    _progress("gpu_voxel: shared mesh+UV preparation done", started)
+
+    _progress("gpu_voxel: nvdiffrast bake-only start", started)
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    t0 = time.perf_counter()
+    nvd_dbg = o_voxel.postprocess.bake_glb_maps_from_prepared(
+        prepared=prep,
+        attr_volume=attr_volume,
+        coords=coords,
+        attr_layout=attr_layout,
+        aabb=aabb,
+        voxel_size=voxel_size,
+        grid_size=grid_size,
+        texture_size=texture_size,
+        backend="nvdiffrast",
+    )
+    torch.cuda.synchronize()
+    nvd_time = time.perf_counter() - t0
+    nvd_alloc_mb = torch.cuda.max_memory_allocated() / (1024**2)
+    nvd_reserved_mb = torch.cuda.max_memory_reserved() / (1024**2)
+
+    _progress("gpu_voxel: zyrex bake-only start", started)
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    t1 = time.perf_counter()
+    zyx_dbg = o_voxel.postprocess.bake_glb_maps_from_prepared(
+        prepared=prep,
+        attr_volume=attr_volume,
+        coords=coords,
+        attr_layout=attr_layout,
+        aabb=aabb,
+        voxel_size=voxel_size,
+        grid_size=grid_size,
+        texture_size=texture_size,
+        backend="zyrex",
+    )
+    torch.cuda.synchronize()
+    zyx_time = time.perf_counter() - t1
+    zyx_alloc_mb = torch.cuda.max_memory_allocated() / (1024**2)
+    zyx_reserved_mb = torch.cuda.max_memory_reserved() / (1024**2)
+    _progress("gpu_voxel: bake-only runs complete", started)
+
+    nvd_hashes = dict(nvd_dbg.get("hashes", {}))
+    zyx_hashes = dict(zyx_dbg.get("hashes", {}))
+    if nvd_hashes != zyx_hashes:
+        raise RuntimeError(
+            "Coverage comparison requires identical prepared UV layout and faces. "
+            f"nvdiffrast hashes={nvd_hashes}, zyrex hashes={zyx_hashes}"
+        )
 
     nvd_mask = np.array(nvd_dbg["mask_raw"], dtype=bool)
     zyx_mask = np.array(zyx_dbg["mask_raw"], dtype=bool)
@@ -871,11 +913,12 @@ def run_gpu_comparison_voxel_input(
     png_paths = {
         "base_color": output_dir / "gpu_voxel_base_color_side_by_side.png",
         "metallic_roughness": output_dir / "gpu_voxel_metallic_roughness_side_by_side.png",
-        "normal": output_dir / "gpu_voxel_normal_side_by_side.png",
     }
     _save_side_by_side_png(nvd_base, zyx_base, png_paths["base_color"])
     _save_side_by_side_png(nvd_mr, zyx_mr, png_paths["metallic_roughness"])
-    _save_side_by_side_png(nvd_normal, zyx_normal, png_paths["normal"])
+    if nvd_dbg["maps_filled"].get("normal") is not None:
+        png_paths["normal"] = output_dir / "gpu_voxel_normal_side_by_side.png"
+        _save_side_by_side_png(nvd_normal, zyx_normal, png_paths["normal"])
 
     def map_metric_pack(pred: np.ndarray, ref: np.ndarray) -> Dict[str, object]:
         return {
@@ -889,17 +932,39 @@ def run_gpu_comparison_voxel_input(
             },
         }
 
+    normal_metrics: Dict[str, object]
+    if nvd_dbg["maps_filled"].get("normal") is None:
+        zyx_valid = zyx_normal[zyx_mask]
+        normal_metrics = {
+            "status": "not_compared",
+            "reason": "nvdiffrast backend did not emit a normal map in this pipeline path.",
+            "zyrex_sanity": {
+                "covered_ratio": float(zyx_mask.mean()),
+                "mean": zyx_valid.mean(axis=0).tolist() if zyx_valid.size else [0.0, 0.0, 0.0],
+                "std": zyx_valid.std(axis=0).tolist() if zyx_valid.size else [0.0, 0.0, 0.0],
+                "min": zyx_valid.min(axis=0).tolist() if zyx_valid.size else [0.0, 0.0, 0.0],
+                "max": zyx_valid.max(axis=0).tolist() if zyx_valid.size else [0.0, 0.0, 0.0],
+            },
+        }
+    else:
+        normal_metrics = map_metric_pack(zyx_normal, nvd_normal)
+
     return {
         "status": "measured",
-        "mode": "voxel_input_to_glb",
+        "mode": "voxel_input_shared_prep_bake_only",
         "voxel_input_path": str(voxel_input_path.resolve()),
-        "timing_seconds": {"nvdiffrast": nvd_time, "zyrex": zyx_time},
-        "peak_vram_mb": {
-            "nvdiffrast_allocated": nvd_alloc_mb,
-            "nvdiffrast_reserved": nvd_reserved_mb,
-            "zyrex_allocated": zyx_alloc_mb,
-            "zyrex_reserved": zyx_reserved_mb,
+        "timing_seconds": {
+            "shared_prepare_once": prep_time,
+            "nvdiffrast_bake_only": nvd_time,
+            "zyrex_bake_only": zyx_time,
         },
+        "peak_vram_mb": {
+            "nvdiffrast_bake_only_allocated": nvd_alloc_mb,
+            "nvdiffrast_bake_only_reserved": nvd_reserved_mb,
+            "zyrex_bake_only_allocated": zyx_alloc_mb,
+            "zyrex_bake_only_reserved": zyx_reserved_mb,
+        },
+        "shared_prepared_hashes": nvd_hashes,
         "seam_coverage": {
             "nvdiffrast_ratio": float(nvd_mask.mean()),
             "zyrex_ratio": float(zyx_mask.mean()),
@@ -910,7 +975,7 @@ def run_gpu_comparison_voxel_input(
         "map_metrics_vs_nvdiffrast": {
             "base_color": map_metric_pack(zyx_base, nvd_base),
             "metallic_roughness": map_metric_pack(zyx_mr, nvd_mr),
-            "normal": map_metric_pack(zyx_normal, nvd_normal),
+            "normal": normal_metrics,
         },
         "side_by_side_pngs": {k: str(v.resolve()) for k, v in png_paths.items()},
     }

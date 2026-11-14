@@ -85,6 +85,7 @@ def main() -> None:
     pipeline = Trellis2ImageTo3DPipeline.from_pretrained(args.model_id)
     pipeline.to(torch.device("cuda"))
 
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     wall_start = time.perf_counter()
     outputs, run_metrics = pipeline.run(
         image=image,
@@ -143,7 +144,6 @@ def main() -> None:
         remesh_project=0,
         use_tqdm=True,
     )
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     glb_path = output_dir / f"low_vram_benchmark_{ts}.glb"
     glb.export(str(glb_path), extension_webp=True)
     wall_total = time.perf_counter() - wall_start

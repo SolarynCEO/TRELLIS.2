@@ -1,4 +1,5 @@
 from typing import *
+import hashlib
 import os
 from tqdm import tqdm
 import numpy as np
@@ -32,10 +33,344 @@ def _resolve_zyrex_sample_chunk_size() -> int:
                 return parsed
         except ValueError:
             pass
-    # Lower default chunk for 8GB profile.
     if _is_truthy(os.environ.get("ZYREX_LOW_VRAM")):
         return 65536
     return 262144
+
+
+def _normalize_volume_meta(
+    aabb: Union[list, tuple, np.ndarray, torch.Tensor],
+    voxel_size: Union[float, list, tuple, np.ndarray, torch.Tensor, None],
+    grid_size: Union[int, list, tuple, np.ndarray, torch.Tensor, None],
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if isinstance(aabb, (list, tuple)):
+        aabb = np.array(aabb)
+    if isinstance(aabb, np.ndarray):
+        aabb = torch.tensor(aabb, dtype=torch.float32, device=device)
+    assert isinstance(aabb, torch.Tensor), f"aabb must be list/tuple/ndarray/tensor, got {type(aabb)}"
+    assert aabb.dim() == 2 and aabb.size(0) == 2 and aabb.size(1) == 3
+
+    if voxel_size is not None:
+        if isinstance(voxel_size, float):
+            voxel_size = [voxel_size, voxel_size, voxel_size]
+        if isinstance(voxel_size, (list, tuple)):
+            voxel_size = np.array(voxel_size)
+        if isinstance(voxel_size, np.ndarray):
+            voxel_size = torch.tensor(voxel_size, dtype=torch.float32, device=device)
+        grid_size = ((aabb[1] - aabb[0]) / voxel_size).round().int()
+    else:
+        assert grid_size is not None, "Either voxel_size or grid_size must be provided"
+        if isinstance(grid_size, int):
+            grid_size = [grid_size, grid_size, grid_size]
+        if isinstance(grid_size, (list, tuple)):
+            grid_size = np.array(grid_size)
+        if isinstance(grid_size, np.ndarray):
+            grid_size = torch.tensor(grid_size, dtype=torch.int32, device=device)
+        voxel_size = (aabb[1] - aabb[0]) / grid_size
+
+    assert isinstance(voxel_size, torch.Tensor) and voxel_size.dim() == 1 and voxel_size.size(0) == 3
+    assert isinstance(grid_size, torch.Tensor) and grid_size.dim() == 1 and grid_size.size(0) == 3
+    return aabb, voxel_size, grid_size
+
+
+def _hash_face_uv(out_faces: torch.Tensor, out_uvs: torch.Tensor) -> Dict[str, str]:
+    faces_np = out_faces.detach().cpu().numpy().astype(np.int32, copy=False)
+    uvs_np = out_uvs.detach().cpu().numpy().astype(np.float32, copy=False)
+    return {
+        "faces_sha1": hashlib.sha1(faces_np.tobytes()).hexdigest(),
+        "uvs_sha1": hashlib.sha1(uvs_np.tobytes()).hexdigest(),
+    }
+
+
+def prepare_glb_bake_inputs(
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
+    aabb: torch.Tensor,
+    grid_size: torch.Tensor,
+    decimation_target: int = 1000000,
+    remesh: bool = False,
+    remesh_band: float = 1,
+    remesh_project: float = 0.9,
+    mesh_cluster_threshold_cone_half_angle_rad=np.radians(90.0),
+    mesh_cluster_refine_iterations=0,
+    mesh_cluster_global_iterations=1,
+    mesh_cluster_smooth_strength=1,
+    verbose: bool = False,
+    progress_cb: Optional[Callable[[], None]] = None,
+) -> Dict[str, Any]:
+    vertices = vertices.cuda()
+    faces = faces.cuda()
+
+    mesh = cumesh.CuMesh()
+    mesh.init(vertices, faces)
+    mesh.fill_holes(max_hole_perimeter=3e-2)
+    if verbose:
+        print(f"After filling holes: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
+    src_vertices, src_faces = mesh.read()
+    if progress_cb is not None:
+        progress_cb()
+
+    bvh = cumesh.cuBVH(src_vertices, src_faces)
+    if progress_cb is not None:
+        progress_cb()
+
+    if not remesh:
+        mesh.simplify(decimation_target * 3, verbose=verbose)
+        mesh.remove_duplicate_faces()
+        mesh.repair_non_manifold_edges()
+        mesh.remove_small_connected_components(1e-5)
+        mesh.fill_holes(max_hole_perimeter=3e-2)
+        mesh.simplify(decimation_target, verbose=verbose)
+        mesh.remove_duplicate_faces()
+        mesh.repair_non_manifold_edges()
+        mesh.remove_small_connected_components(1e-5)
+        mesh.fill_holes(max_hole_perimeter=3e-2)
+        mesh.unify_face_orientations()
+    else:
+        center = aabb.mean(dim=0)
+        scale = (aabb[1] - aabb[0]).max().item()
+        resolution = grid_size.max().item()
+        mesh.init(
+            *cumesh.remeshing.remesh_narrow_band_dc(
+                src_vertices,
+                src_faces,
+                center=center,
+                scale=(resolution + 3 * remesh_band) / resolution * scale,
+                resolution=resolution,
+                band=remesh_band,
+                project_back=remesh_project,
+                verbose=verbose,
+                bvh=bvh,
+            )
+        )
+        mesh.simplify(decimation_target, verbose=verbose)
+    if progress_cb is not None:
+        progress_cb()
+
+    out_vertices, out_faces, out_uvs, out_vmaps = mesh.uv_unwrap(
+        compute_charts_kwargs={
+            "threshold_cone_half_angle_rad": mesh_cluster_threshold_cone_half_angle_rad,
+            "refine_iterations": mesh_cluster_refine_iterations,
+            "global_iterations": mesh_cluster_global_iterations,
+            "smooth_strength": mesh_cluster_smooth_strength,
+        },
+        return_vmaps=True,
+        verbose=verbose,
+    )
+    out_vertices = out_vertices.cuda()
+    out_faces = out_faces.cuda()
+    out_uvs = out_uvs.cuda()
+    out_vmaps = out_vmaps.cuda()
+    mesh.compute_vertex_normals()
+    out_normals = mesh.read_vertex_normals()[out_vmaps]
+    if progress_cb is not None:
+        progress_cb()
+
+    return {
+        "mesh": mesh,
+        "bvh": bvh,
+        "source_vertices": src_vertices,
+        "source_faces": src_faces,
+        "out_vertices": out_vertices,
+        "out_faces": out_faces,
+        "out_uvs": out_uvs,
+        "out_normals": out_normals,
+        "hashes": _hash_face_uv(out_faces, out_uvs),
+    }
+
+
+def _bake_maps_nvdiffrast(
+    prepared: Dict[str, Any],
+    attr_volume: torch.Tensor,
+    coords: torch.Tensor,
+    attr_layout: Dict[str, slice],
+    aabb: torch.Tensor,
+    voxel_size: torch.Tensor,
+    grid_size: torch.Tensor,
+    texture_size: int,
+) -> Dict[str, Any]:
+    if dr is None:
+        raise ImportError("nvdiffrast is required for ZYREX_BAKER=nvdiffrast but is not importable.")
+
+    out_vertices = prepared["out_vertices"]
+    out_faces = prepared["out_faces"]
+    bvh = prepared["bvh"]
+    src_vertices = prepared["source_vertices"]
+    src_faces = prepared["source_faces"]
+
+    ctx = dr.RasterizeCudaContext()
+    uvs_rast = torch.cat(
+        [
+            prepared["out_uvs"] * 2 - 1,
+            torch.zeros_like(prepared["out_uvs"][:, :1]),
+            torch.ones_like(prepared["out_uvs"][:, :1]),
+        ],
+        dim=-1,
+    ).unsqueeze(0)
+    rast = torch.zeros((1, texture_size, texture_size, 4), device="cuda", dtype=torch.float32)
+
+    for i in range(0, out_faces.shape[0], 100000):
+        rast_chunk, _ = dr.rasterize(ctx, uvs_rast, out_faces[i : i + 100000], resolution=[texture_size, texture_size])
+        mask_chunk = rast_chunk[..., 3:4] > 0
+        rast_chunk[..., 3:4] += i
+        rast = torch.where(mask_chunk, rast_chunk, rast)
+
+    mask = rast[0, ..., 3] > 0
+    pos = dr.interpolate(out_vertices.unsqueeze(0), rast, out_faces)[0][0]
+    valid_pos = pos[mask]
+    _, face_id, uvw = bvh.unsigned_distance(valid_pos, return_uvw=True)
+    orig_tri_verts = src_vertices[src_faces[face_id.long()]]
+    valid_pos = (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
+
+    attrs = torch.zeros(texture_size, texture_size, attr_volume.shape[1], device="cuda")
+    attrs[mask] = grid_sample_3d(
+        attr_volume,
+        torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=-1),
+        shape=torch.Size([1, attr_volume.shape[1], *grid_size.tolist()]),
+        grid=((valid_pos - aabb[0]) / voxel_size).reshape(1, -1, 3),
+        mode="trilinear",
+    )
+    mask_np = mask.cpu().numpy()
+    base_color = np.clip(attrs[..., attr_layout["base_color"]].cpu().numpy() * 255, 0, 255).astype(np.uint8)
+    metallic = np.clip(attrs[..., attr_layout["metallic"]].cpu().numpy() * 255, 0, 255).astype(np.uint8)
+    roughness = np.clip(attrs[..., attr_layout["roughness"]].cpu().numpy() * 255, 0, 255).astype(np.uint8)
+    alpha = np.clip(attrs[..., attr_layout["alpha"]].cpu().numpy() * 255, 0, 255).astype(np.uint8)
+    return {
+        "mask_raw": mask_np,
+        "maps_raw": {
+            "base_color": base_color,
+            "metallic": metallic,
+            "roughness": roughness,
+            "alpha": alpha,
+            "normal": None,
+        },
+    }
+
+
+def _bake_maps_zyrex(
+    prepared: Dict[str, Any],
+    attr_volume: torch.Tensor,
+    coords: torch.Tensor,
+    attr_layout: Dict[str, slice],
+    aabb: torch.Tensor,
+    voxel_size: torch.Tensor,
+    grid_size: torch.Tensor,
+    texture_size: int,
+    sample_chunk_size: int,
+) -> Dict[str, Any]:
+    from .zyrex_uv_baker import bake_voxel_pbr_maps
+
+    out_vertices = prepared["out_vertices"]
+    out_faces = prepared["out_faces"]
+    out_uvs = prepared["out_uvs"]
+    out_normals = prepared["out_normals"]
+    bvh = prepared["bvh"]
+    src_vertices = prepared["source_vertices"]
+    src_faces = prepared["source_faces"]
+
+    if not isinstance(out_normals, torch.Tensor):
+        out_normals_t = torch.as_tensor(out_normals, dtype=torch.float32, device=out_vertices.device)
+    else:
+        out_normals_t = out_normals.to(out_vertices.device, dtype=torch.float32)
+
+    def map_to_original_surface(query_positions: torch.Tensor) -> torch.Tensor:
+        if query_positions.shape[0] == 0:
+            return query_positions
+        _, face_id, uvw = bvh.unsigned_distance(query_positions, return_uvw=True)
+        orig_tri_verts = src_vertices[src_faces[face_id.long()]]
+        return (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
+
+    baked = bake_voxel_pbr_maps(
+        vertices=out_vertices,
+        faces=out_faces.long(),
+        uvs=out_uvs,
+        vertex_normals=out_normals_t,
+        attr_volume=attr_volume,
+        coords=coords,
+        attr_layout=attr_layout,
+        aabb=aabb,
+        voxel_size=voxel_size,
+        grid_size=grid_size,
+        texture_size=texture_size,
+        seam_padding_iterations=0,
+        position_mapper=map_to_original_surface,
+        sample_chunk_size=sample_chunk_size,
+    )
+    mask_np = baked["mask"].cpu().numpy()
+    base_color = torch.clamp(baked["base_color"] * 255.0, 0.0, 255.0).byte().cpu().numpy()
+    metallic = torch.clamp(baked["metallic"] * 255.0, 0.0, 255.0).byte().cpu().numpy()
+    roughness = torch.clamp(baked["roughness"] * 255.0, 0.0, 255.0).byte().cpu().numpy()
+    alpha = torch.clamp(baked["alpha"] * 255.0, 0.0, 255.0).byte().cpu().numpy()
+    normal = torch.clamp(baked["normal"] * 255.0, 0.0, 255.0).byte().cpu().numpy()
+    return {
+        "mask_raw": mask_np,
+        "maps_raw": {
+            "base_color": base_color,
+            "metallic": metallic,
+            "roughness": roughness,
+            "alpha": alpha,
+            "normal": normal,
+        },
+    }
+
+
+def bake_glb_maps_from_prepared(
+    prepared: Dict[str, Any],
+    attr_volume: torch.Tensor,
+    coords: torch.Tensor,
+    attr_layout: Dict[str, slice],
+    aabb: torch.Tensor,
+    voxel_size: torch.Tensor,
+    grid_size: torch.Tensor,
+    texture_size: int,
+    backend: str,
+) -> Dict[str, Any]:
+    if backend == "nvdiffrast":
+        baked = _bake_maps_nvdiffrast(prepared, attr_volume, coords, attr_layout, aabb, voxel_size, grid_size, texture_size)
+    elif backend == "zyrex":
+        baked = _bake_maps_zyrex(
+            prepared,
+            attr_volume,
+            coords,
+            attr_layout,
+            aabb,
+            voxel_size,
+            grid_size,
+            texture_size,
+            sample_chunk_size=_resolve_zyrex_sample_chunk_size(),
+        )
+    else:
+        raise NotImplementedError(
+            f"ZYREX_BAKER={backend!r} is reserved but not implemented. "
+            "Use ZYREX_BAKER=nvdiffrast (default) or ZYREX_BAKER=zyrex."
+        )
+
+    mask_raw = baked["mask_raw"]
+    maps_raw = baked["maps_raw"]
+    mask_inv = (~mask_raw).astype(np.uint8)
+    base_color = cv2.inpaint(maps_raw["base_color"], mask_inv, 3, cv2.INPAINT_TELEA)
+    metallic = cv2.inpaint(maps_raw["metallic"], mask_inv, 1, cv2.INPAINT_TELEA)
+    roughness = cv2.inpaint(maps_raw["roughness"], mask_inv, 1, cv2.INPAINT_TELEA)
+    alpha = cv2.inpaint(maps_raw["alpha"], mask_inv, 1, cv2.INPAINT_TELEA)
+    normal = maps_raw["normal"]
+    if normal is not None:
+        normal = cv2.inpaint(normal, mask_inv, 3, cv2.INPAINT_TELEA)
+
+    maps_filled: Dict[str, Any] = {
+        "base_color": base_color,
+        "metallic": metallic,
+        "roughness": roughness,
+        "alpha": alpha,
+        "normal": normal,
+    }
+    return {
+        "backend": backend,
+        "hashes": prepared["hashes"],
+        "mask_raw": mask_raw,
+        "maps_raw": maps_raw,
+        "maps_filled": maps_filled,
+    }
 
 
 def to_glb(
@@ -85,168 +420,36 @@ def to_glb(
         verbose: whether to print verbose messages
         use_tqdm: whether to use tqdm to display progress bar
     """
-    # --- Input Normalization (AABB, Voxel Size, Grid Size) ---
-    if isinstance(aabb, (list, tuple)):
-        aabb = np.array(aabb)
-    if isinstance(aabb, np.ndarray):
-        aabb = torch.tensor(aabb, dtype=torch.float32, device=coords.device)
-    assert isinstance(aabb, torch.Tensor), f"aabb must be a list, tuple, np.ndarray, or torch.Tensor, but got {type(aabb)}"
-    assert aabb.dim() == 2, f"aabb must be a 2D tensor, but got {aabb.shape}"
-    assert aabb.size(0) == 2, f"aabb must have 2 rows, but got {aabb.size(0)}"
-    assert aabb.size(1) == 3, f"aabb must have 3 columns, but got {aabb.size(1)}"
-
-    # Calculate grid dimensions based on AABB and voxel size
-    if voxel_size is not None:
-        if isinstance(voxel_size, float):
-            voxel_size = [voxel_size, voxel_size, voxel_size]
-        if isinstance(voxel_size, (list, tuple)):
-            voxel_size = np.array(voxel_size)
-        if isinstance(voxel_size, np.ndarray):
-            voxel_size = torch.tensor(voxel_size, dtype=torch.float32, device=coords.device)
-        grid_size = ((aabb[1] - aabb[0]) / voxel_size).round().int()
-    else:
-        assert grid_size is not None, "Either voxel_size or grid_size must be provided"
-        if isinstance(grid_size, int):
-            grid_size = [grid_size, grid_size, grid_size]
-        if isinstance(grid_size, (list, tuple)):
-            grid_size = np.array(grid_size)
-        if isinstance(grid_size, np.ndarray):
-            grid_size = torch.tensor(grid_size, dtype=torch.int32, device=coords.device)
-        voxel_size = (aabb[1] - aabb[0]) / grid_size
-    
-    # Assertions for dimensions
-    assert isinstance(voxel_size, torch.Tensor)
-    assert voxel_size.dim() == 1 and voxel_size.size(0) == 3
-    assert isinstance(grid_size, torch.Tensor)
-    assert grid_size.dim() == 1 and grid_size.size(0) == 3
+    aabb, voxel_size, grid_size = _normalize_volume_meta(
+        aabb=aabb,
+        voxel_size=voxel_size,
+        grid_size=grid_size,
+        device=coords.device,
+    )
     
     if use_tqdm:
         pbar = tqdm(total=6, desc="Extracting GLB")
     if verbose:
         print(f"Original mesh: {vertices.shape[0]} vertices, {faces.shape[0]} faces")
 
-    # Move data to GPU
-    vertices = vertices.cuda()
-    faces = faces.cuda()
-    
-    # Initialize CUDA mesh handler
-    mesh = cumesh.CuMesh()
-    mesh.init(vertices, faces)
-    
-    # --- Initial Mesh Cleaning ---
-    # Fills holes as much as we can before processing
-    mesh.fill_holes(max_hole_perimeter=3e-2)
-    if verbose:
-        print(f"After filling holes: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
-    vertices, faces = mesh.read()
     if use_tqdm:
-        pbar.update(1)
-        
-    # Build BVH for the current mesh to guide remeshing
-    if use_tqdm:
-        pbar.set_description("Building BVH")
-    if verbose:
-        print(f"Building BVH for current mesh...", end='', flush=True)
-    bvh = cumesh.cuBVH(vertices, faces)
-    if use_tqdm:
-        pbar.update(1)
-    if verbose:
-        print("Done")
-        
-    if use_tqdm:
-        pbar.set_description("Cleaning mesh")
-    if verbose:
-        print("Cleaning mesh...")
-    
-    # --- Branch 1: Standard Pipeline (Simplification & Cleaning) ---
-    if not remesh:
-        # Step 1: Aggressive simplification (3x target)
-        mesh.simplify(decimation_target * 3, verbose=verbose)
-        if verbose:
-            print(f"After inital simplification: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
-        
-        # Step 2: Clean up topology (duplicates, non-manifolds, isolated parts)
-        mesh.remove_duplicate_faces()
-        mesh.repair_non_manifold_edges()
-        mesh.remove_small_connected_components(1e-5)
-        mesh.fill_holes(max_hole_perimeter=3e-2)
-        if verbose:
-            print(f"After initial cleanup: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
-            
-        # Step 3: Final simplification to target count
-        mesh.simplify(decimation_target, verbose=verbose)
-        if verbose:
-            print(f"After final simplification: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
-        
-        # Step 4: Final Cleanup loop
-        mesh.remove_duplicate_faces()
-        mesh.repair_non_manifold_edges()
-        mesh.remove_small_connected_components(1e-5)
-        mesh.fill_holes(max_hole_perimeter=3e-2)
-        if verbose:
-            print(f"After final cleanup: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
-            
-        # Step 5: Unify face orientations
-        mesh.unify_face_orientations()
-    
-    # --- Branch 2: Remeshing Pipeline ---
-    else:
-        center = aabb.mean(dim=0)
-        scale = (aabb[1] - aabb[0]).max().item()
-        resolution = grid_size.max().item()
-        
-        # Perform Dual Contouring remeshing (rebuilds topology)
-        mesh.init(*cumesh.remeshing.remesh_narrow_band_dc(
-            vertices, faces,
-            center = center,
-            scale = (resolution + 3 * remesh_band) / resolution * scale,
-            resolution = resolution,
-            band = remesh_band,
-            project_back = remesh_project, # Snaps vertices back to original surface
-            verbose = verbose,
-            bvh = bvh,
-        ))
-        if verbose:
-            print(f"After remeshing: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
-        
-        # Simplify and clean the remeshed result (similar logic to above)
-        mesh.simplify(decimation_target, verbose=verbose)
-        if verbose:
-            print(f"After simplifying: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
-    
-    if use_tqdm:
-        pbar.update(1)
-    if verbose:
-        print("Done")
-        
-    
-    # --- UV Parameterization ---
-    if use_tqdm:
-        pbar.set_description("Parameterizing new mesh")
-    if verbose:
-        print("Parameterizing new mesh...")
-    
-    out_vertices, out_faces, out_uvs, out_vmaps = mesh.uv_unwrap(
-        compute_charts_kwargs={
-            "threshold_cone_half_angle_rad": mesh_cluster_threshold_cone_half_angle_rad,
-            "refine_iterations": mesh_cluster_refine_iterations,
-            "global_iterations": mesh_cluster_global_iterations,
-            "smooth_strength": mesh_cluster_smooth_strength,
-        },
-        return_vmaps=True,
+        pbar.set_description("Preparing mesh/UVs")
+    prepared = prepare_glb_bake_inputs(
+        vertices=vertices,
+        faces=faces,
+        aabb=aabb,
+        grid_size=grid_size,
+        decimation_target=decimation_target,
+        remesh=remesh,
+        remesh_band=remesh_band,
+        remesh_project=remesh_project,
+        mesh_cluster_threshold_cone_half_angle_rad=mesh_cluster_threshold_cone_half_angle_rad,
+        mesh_cluster_refine_iterations=mesh_cluster_refine_iterations,
+        mesh_cluster_global_iterations=mesh_cluster_global_iterations,
+        mesh_cluster_smooth_strength=mesh_cluster_smooth_strength,
         verbose=verbose,
+        progress_cb=(lambda: pbar.update(1)) if use_tqdm else None,
     )
-    out_vertices = out_vertices.cuda()
-    out_faces = out_faces.cuda()
-    out_uvs = out_uvs.cuda()
-    out_vmaps = out_vmaps.cuda()
-    mesh.compute_vertex_normals()
-    out_normals = mesh.read_vertex_normals()[out_vmaps]
-    
-    if use_tqdm:
-        pbar.update(1)
-    if verbose:
-        print("Done")
     
     # --- Texture Baking (Attribute Sampling) ---
     if use_tqdm:
@@ -265,94 +468,17 @@ def to_glb(
             "Use ZYREX_BAKER=nvdiffrast (default) or ZYREX_BAKER=zyrex."
         )
 
-    normal_map = None
-    mask = None
-    base_color = None
-    metallic = None
-    roughness = None
-    alpha = None
-    if backend == "zyrex":
-        from .zyrex_uv_baker import bake_voxel_pbr_maps
-
-        out_normals_t = out_normals
-        if not isinstance(out_normals_t, torch.Tensor):
-            out_normals_t = torch.as_tensor(out_normals_t, dtype=torch.float32, device=out_vertices.device)
-        else:
-            out_normals_t = out_normals_t.to(out_vertices.device, dtype=torch.float32)
-
-        def map_to_original_surface(query_positions: torch.Tensor) -> torch.Tensor:
-            if query_positions.shape[0] == 0:
-                return query_positions
-            _, face_id, uvw = bvh.unsigned_distance(query_positions, return_uvw=True)
-            orig_tri_verts = vertices[faces[face_id.long()]]
-            return (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
-
-        baked = bake_voxel_pbr_maps(
-            vertices=out_vertices,
-            faces=out_faces.long(),
-            uvs=out_uvs,
-            vertex_normals=out_normals_t,
-            attr_volume=attr_volume,
-            coords=coords,
-            attr_layout=attr_layout,
-            aabb=aabb,
-            voxel_size=voxel_size,
-            grid_size=grid_size,
-            texture_size=texture_size,
-            seam_padding_iterations=0,
-            position_mapper=map_to_original_surface,
-            sample_chunk_size=_resolve_zyrex_sample_chunk_size(),
-        )
-        mask = baked["mask"].cpu().numpy()
-        base_color = torch.clamp(baked["base_color"] * 255.0, 0.0, 255.0).byte().cpu().numpy()
-        metallic = torch.clamp(baked["metallic"] * 255.0, 0.0, 255.0).byte().cpu().numpy()
-        roughness = torch.clamp(baked["roughness"] * 255.0, 0.0, 255.0).byte().cpu().numpy()
-        alpha = torch.clamp(baked["alpha"] * 255.0, 0.0, 255.0).byte().cpu().numpy()
-        normal_map = torch.clamp(baked["normal"] * 255.0, 0.0, 255.0).byte().cpu().numpy()
-    else:
-        # Setup differentiable rasterizer context
-        ctx = dr.RasterizeCudaContext()
-        # Prepare UV coordinates for rasterization (rendering in UV space)
-        uvs_rast = torch.cat([out_uvs * 2 - 1, torch.zeros_like(out_uvs[:, :1]), torch.ones_like(out_uvs[:, :1])], dim=-1).unsqueeze(0)
-        rast = torch.zeros((1, texture_size, texture_size, 4), device='cuda', dtype=torch.float32)
-
-        # Rasterize in chunks to save memory
-        for i in range(0, out_faces.shape[0], 100000):
-            rast_chunk, _ = dr.rasterize(
-                ctx, uvs_rast, out_faces[i:i+100000],
-                resolution=[texture_size, texture_size],
-            )
-            mask_chunk = rast_chunk[..., 3:4] > 0
-            rast_chunk[..., 3:4] += i  # Store face ID in alpha channel
-            rast = torch.where(mask_chunk, rast_chunk, rast)
-
-        # Mask of valid pixels in texture
-        mask = rast[0, ..., 3] > 0
-
-        # Interpolate 3D positions in UV space (finding 3D coord for every texel)
-        pos = dr.interpolate(out_vertices.unsqueeze(0), rast, out_faces)[0][0]
-        valid_pos = pos[mask]
-
-        # Map these positions back to the *original* high-res mesh to get accurate attributes
-        # This corrects geometric errors introduced by simplification/remeshing
-        _, face_id, uvw = bvh.unsigned_distance(valid_pos, return_uvw=True)
-        orig_tri_verts = vertices[faces[face_id.long()]]  # (N_new, 3, 3)
-        valid_pos = (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
-
-        # Trilinear sampling from the attribute volume (Color, Material props)
-        attrs = torch.zeros(texture_size, texture_size, attr_volume.shape[1], device='cuda')
-        attrs[mask] = grid_sample_3d(
-            attr_volume,
-            torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=-1),
-            shape=torch.Size([1, attr_volume.shape[1], *grid_size.tolist()]),
-            grid=((valid_pos - aabb[0]) / voxel_size).reshape(1, -1, 3),
-            mode='trilinear',
-        )
-        mask = mask.cpu().numpy()
-        base_color = np.clip(attrs[..., attr_layout['base_color']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
-        metallic = np.clip(attrs[..., attr_layout['metallic']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
-        roughness = np.clip(attrs[..., attr_layout['roughness']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
-        alpha = np.clip(attrs[..., attr_layout['alpha']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
+    baked = bake_glb_maps_from_prepared(
+        prepared=prepared,
+        attr_volume=attr_volume,
+        coords=coords,
+        attr_layout=attr_layout,
+        aabb=aabb,
+        voxel_size=voxel_size,
+        grid_size=grid_size,
+        texture_size=texture_size,
+        backend=backend,
+    )
     if use_tqdm:
         pbar.update(1)
     if verbose:
@@ -365,21 +491,14 @@ def to_glb(
         print("Finalizing mesh...", end='', flush=True)
     
     alpha_mode = 'OPAQUE'
-    mask_raw = mask.copy()
-    base_color_raw = base_color.copy()
-    metallic_raw = metallic.copy()
-    roughness_raw = roughness.copy()
-    alpha_raw = alpha.copy()
-    normal_raw = normal_map.copy() if normal_map is not None else None
-
-    # Keep seam fill behavior equivalent to production nvdiffrast path.
-    mask_inv = (~mask).astype(np.uint8)
-    base_color = cv2.inpaint(base_color, mask_inv, 3, cv2.INPAINT_TELEA)
-    metallic = cv2.inpaint(metallic, mask_inv, 1, cv2.INPAINT_TELEA)
-    roughness = cv2.inpaint(roughness, mask_inv, 1, cv2.INPAINT_TELEA)
-    alpha = cv2.inpaint(alpha, mask_inv, 1, cv2.INPAINT_TELEA)
-    if normal_map is not None:
-        normal_map = cv2.inpaint(normal_map, mask_inv, 3, cv2.INPAINT_TELEA)
+    mask_raw = baked["mask_raw"]
+    maps_raw = baked["maps_raw"]
+    maps_filled = baked["maps_filled"]
+    base_color = maps_filled["base_color"]
+    metallic = maps_filled["metallic"]
+    roughness = maps_filled["roughness"]
+    alpha = maps_filled["alpha"]
+    normal_map = maps_filled["normal"]
 
     if metallic.ndim == 2:
         metallic = metallic[..., None]
@@ -403,10 +522,10 @@ def to_glb(
         setattr(material, "normalTexture", Image.fromarray(normal_map))
     
     # --- Coordinate System Conversion & Final Object ---
-    vertices_np = out_vertices.cpu().numpy()
-    faces_np = out_faces.cpu().numpy()
-    uvs_np = out_uvs.cpu().numpy()
-    normals_np = out_normals.cpu().numpy()
+    vertices_np = prepared["out_vertices"].cpu().numpy()
+    faces_np = prepared["out_faces"].cpu().numpy()
+    uvs_np = prepared["out_uvs"].cpu().numpy()
+    normals_np = prepared["out_normals"].cpu().numpy()
     
     # Swap Y and Z axes, invert Y (common conversion for GLB compatibility)
     vertices_np[:, 1], vertices_np[:, 2] = vertices_np[:, 2], -vertices_np[:, 1]
@@ -431,20 +550,9 @@ def to_glb(
         return textured_mesh
     debug = {
         "backend": backend,
+        "hashes": prepared["hashes"],
         "mask_raw": mask_raw,
-        "maps_raw": {
-            "base_color": base_color_raw,
-            "metallic": metallic_raw,
-            "roughness": roughness_raw,
-            "alpha": alpha_raw,
-            "normal": normal_raw,
-        },
-        "maps_filled": {
-            "base_color": base_color,
-            "metallic": metallic,
-            "roughness": roughness,
-            "alpha": alpha,
-            "normal": normal_map,
-        },
+        "maps_raw": maps_raw,
+        "maps_filled": maps_filled,
     }
     return textured_mesh, debug
