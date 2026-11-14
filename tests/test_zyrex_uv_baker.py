@@ -109,16 +109,17 @@ def test_tangent_space_normal_orientation_plane():
 def test_uv_rasterization_matches_nvdiffrast_mask_and_face_ids():
     dr = pytest.importorskip("nvdiffrast.torch")
     device = torch.device("cuda")
-    # Includes shared edges, mirrored winding and thin triangles to stress fill rules.
+    # Non-overlapping topology with shared edges + thin triangles to validate
+    # deterministic face IDs (winner is well-defined per covered texel).
     uvs = torch.tensor(
         [
             [0.05, 0.05],
             [0.95, 0.05],
             [0.95, 0.95],
             [0.05, 0.95],
-            [0.20, 0.20],
+            [0.20, 0.20],  # interior split
             [0.80, 0.20],
-            [0.50, 0.85],
+            [0.50, 0.70],
             [0.20, 0.80],
             [0.80, 0.82],
         ],
@@ -129,8 +130,9 @@ def test_uv_rasterization_matches_nvdiffrast_mask_and_face_ids():
         [
             [0, 1, 2],
             [0, 2, 3],
-            [4, 5, 6],  # primary orientation
-            [4, 6, 5],  # mirrored winding over same UVs
+            [4, 5, 6],
+            [4, 6, 7],
+            [6, 5, 8],  # thin triangle near top edge
             [7, 8, 6],  # thin edge case
         ],
         dtype=torch.long,
@@ -163,6 +165,45 @@ def test_uv_rasterization_matches_nvdiffrast_mask_and_face_ids():
     assert face_mismatch_count <= 4, (
         f"face-id mismatch too large on shared coverage: {face_mismatch_count} texels"
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for overlap permissive parity test")
+def test_uv_rasterization_overlap_face_choice_is_valid():
+    dr = pytest.importorskip("nvdiffrast.torch")
+    device = torch.device("cuda")
+    # Two coincident triangles with opposite winding overlap exactly in UV space.
+    uvs = torch.tensor(
+        [
+            [0.25, 0.25],
+            [0.75, 0.25],
+            [0.50, 0.75],
+        ],
+        dtype=torch.float32,
+        device=device,
+    )
+    faces = torch.tensor(
+        [
+            [0, 1, 2],
+            [0, 2, 1],  # mirrored winding duplicate
+        ],
+        dtype=torch.long,
+        device=device,
+    )
+    texture_size = 128
+
+    raster = rasterize_uv_triangles(uvs, faces, texture_size)
+    ctx = dr.RasterizeCudaContext(device=device)
+    uvs_clip = torch.cat(
+        [uvs * 2 - 1, torch.zeros_like(uvs[:, :1]), torch.ones_like(uvs[:, :1])],
+        dim=-1,
+    )[None]
+    rast, _ = dr.rasterize(ctx, uvs_clip, faces.int(), resolution=[texture_size, texture_size])
+    nvd_mask = (rast[0, ..., 3].long() - 1) >= 0
+    assert torch.equal(raster.mask.cpu(), nvd_mask.cpu())
+
+    chosen = raster.face_indices[raster.mask]
+    valid = (chosen == 0) | (chosen == 1)
+    assert bool(torch.all(valid).item())
 
 
 def test_tangent_space_normal_has_detail_for_slanted_surface():

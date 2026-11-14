@@ -42,9 +42,9 @@ def rasterize_uv_triangles(
     dtype = uvs.dtype
 
     if face_chunk_size is None:
-        face_chunk_size = 2048 if _is_truthy(os.environ.get("ZYREX_LOW_VRAM")) else 4096
+        face_chunk_size = 3072 if _is_truthy(os.environ.get("ZYREX_LOW_VRAM")) else 8192
     if max_candidates_per_chunk is None:
-        max_candidates_per_chunk = 1_500_000 if _is_truthy(os.environ.get("ZYREX_LOW_VRAM")) else 4_000_000
+        max_candidates_per_chunk = 2_500_000 if _is_truthy(os.environ.get("ZYREX_LOW_VRAM")) else 8_000_000
     face_chunk_size = max(int(face_chunk_size), 1)
     max_candidates_per_chunk = max(int(max_candidates_per_chunk), 1)
     subpixel_bits = 8
@@ -61,7 +61,7 @@ def rasterize_uv_triangles(
     tris_fp = torch.round(tris * subpixel_scale).to(torch.int64)
 
     num_pixels = height * width
-    best_face = torch.full((num_pixels,), -1, dtype=torch.long, device=device)
+    best_face = torch.full((num_pixels,), -1, dtype=torch.int32, device=device)
     best_bary = torch.zeros((num_pixels, 3), dtype=dtype, device=device)
 
     total_faces = tris.shape[0]
@@ -167,7 +167,7 @@ def rasterize_uv_triangles(
 
         compact_rep = compact_rep[inside]
         pix_idx = y_int[inside] * width + x_int[inside]
-        face_idx = (start + local_face_ids[compact_rep]).long()
+        face_idx = (start + local_face_ids[compact_rep]).to(torch.int32)
         safe_area_f = safe_area.to(torch.float32)
         w0 = -e0.to(torch.float32) / safe_area_f
         w1 = -e1.to(torch.float32) / safe_area_f
@@ -182,30 +182,16 @@ def rasterize_uv_triangles(
             bary[:, 1] = torch.where(swapped_inside, b2, b1)
             bary[:, 2] = torch.where(swapped_inside, b1, b2)
 
-        unique_pix, inv = torch.unique(pix_idx, sorted=False, return_inverse=True)
-        if unique_pix.numel() == 0:
-            start = tentative_end
-            continue
-
-        max_face = torch.iinfo(torch.long).max
-        min_face_per_u = torch.full((unique_pix.shape[0],), max_face, dtype=torch.long, device=device)
-        min_face_per_u.scatter_reduce_(0, inv, face_idx, reduce="amin", include_self=True)
-
-        cand_idx = torch.arange(face_idx.shape[0], device=device, dtype=torch.long)
-        large_idx = torch.full_like(cand_idx, cand_idx.shape[0])
-        is_best_face = face_idx == min_face_per_u[inv]
-        idx_for_u = torch.where(is_best_face, cand_idx, large_idx)
-        chosen_idx_per_u = torch.full((unique_pix.shape[0],), cand_idx.shape[0], dtype=torch.long, device=device)
-        chosen_idx_per_u.scatter_reduce_(0, inv, idx_for_u, reduce="amin", include_self=True)
-        valid_u = chosen_idx_per_u < cand_idx.shape[0]
-        if not valid_u.any():
-            start = tentative_end
-            continue
-
-        chosen_idx = chosen_idx_per_u[valid_u]
-        chosen_pix = unique_pix[valid_u]
-        chosen_face = face_idx[chosen_idx]
-        chosen_bary = bary[chosen_idx]
+        sort_key = pix_idx.to(torch.int64) * total_faces + face_idx.to(torch.int64)
+        order = torch.argsort(sort_key)
+        pix_sorted = pix_idx[order]
+        face_sorted = face_idx[order]
+        bary_sorted = bary[order]
+        keep = torch.ones_like(pix_sorted, dtype=torch.bool)
+        keep[1:] = pix_sorted[1:] != pix_sorted[:-1]
+        chosen_pix = pix_sorted[keep]
+        chosen_face = face_sorted[keep]
+        chosen_bary = bary_sorted[keep]
 
         prev_face = best_face[chosen_pix]
         better = (prev_face < 0) | (chosen_face < prev_face)

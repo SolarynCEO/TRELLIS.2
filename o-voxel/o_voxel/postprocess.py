@@ -1,6 +1,7 @@
 from typing import *
 import hashlib
 import os
+import time
 from tqdm import tqdm
 import numpy as np
 import torch
@@ -199,6 +200,8 @@ def _bake_maps_nvdiffrast(
     src_vertices = prepared["source_vertices"]
     src_faces = prepared["source_faces"]
 
+    timings: Dict[str, float] = {}
+    t0 = time.perf_counter()
     ctx = dr.RasterizeCudaContext()
     uvs_rast = torch.cat(
         [
@@ -216,14 +219,20 @@ def _bake_maps_nvdiffrast(
         rast_chunk[..., 3:4] += i
         rast = torch.where(mask_chunk, rast_chunk, rast)
 
+    timings["rasterize_uv"] = time.perf_counter() - t0
+    t0 = time.perf_counter()
     face_indices = rast[0, ..., 3].long() - 1
     mask = face_indices >= 0
     pos = dr.interpolate(out_vertices.unsqueeze(0), rast, out_faces)[0][0]
     valid_pos = pos[mask]
+    timings["interpolate_uv_to_pos"] = time.perf_counter() - t0
+    t0 = time.perf_counter()
     _, face_id, uvw = bvh.unsigned_distance(valid_pos, return_uvw=True)
     orig_tri_verts = src_vertices[src_faces[face_id.long()]]
     valid_pos = (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
+    timings["bvh_reproject"] = time.perf_counter() - t0
 
+    t0 = time.perf_counter()
     attrs = torch.zeros(texture_size, texture_size, attr_volume.shape[1], device="cuda")
     attrs[mask] = grid_sample_3d(
         attr_volume,
@@ -232,6 +241,8 @@ def _bake_maps_nvdiffrast(
         grid=((valid_pos - aabb[0]) / voxel_size).reshape(1, -1, 3),
         mode="trilinear",
     )
+    timings["sample_attr_volume"] = time.perf_counter() - t0
+    t0 = time.perf_counter()
     pos_mapped = torch.zeros(texture_size, texture_size, 3, dtype=valid_pos.dtype, device=valid_pos.device)
     pos_mapped[mask] = valid_pos
     mask_np = mask.cpu().numpy()
@@ -239,11 +250,13 @@ def _bake_maps_nvdiffrast(
     metallic = np.clip(attrs[..., attr_layout["metallic"]].cpu().numpy() * 255, 0, 255).astype(np.uint8)
     roughness = np.clip(attrs[..., attr_layout["roughness"]].cpu().numpy() * 255, 0, 255).astype(np.uint8)
     alpha = np.clip(attrs[..., attr_layout["alpha"]].cpu().numpy() * 255, 0, 255).astype(np.uint8)
+    timings["quantize_maps"] = time.perf_counter() - t0
     return {
         "mask_raw": mask_np,
         "face_indices_raw": face_indices.cpu().numpy().astype(np.int32),
         "sample_positions_raw": pos_mapped.cpu().numpy().astype(np.float32),
         "sampled_attrs_raw": attrs.cpu().numpy().astype(np.float32),
+        "timings": timings,
         "maps_raw": {
             "base_color": base_color,
             "metallic": metallic,
@@ -290,11 +303,17 @@ def _bake_maps_zyrex(
         orig_tri_verts = src_vertices[src_faces[face_id.long()]]
         return (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
 
+    timings: Dict[str, float] = {}
+    t0 = time.perf_counter()
     raster = rasterize_uv_triangles(out_uvs, out_faces.long(), texture_size)
     pos = interpolate_vertex_attributes(out_vertices, out_faces.long(), raster)
+    timings["rasterize_uv_and_interpolate_pos"] = time.perf_counter() - t0
+    t0 = time.perf_counter()
     query_positions = pos[raster.mask]
     query_positions = map_to_original_surface(query_positions)
+    timings["bvh_reproject"] = time.perf_counter() - t0
 
+    t0 = time.perf_counter()
     attrs = torch.zeros(texture_size, texture_size, attr_volume.shape[1], device=out_vertices.device, dtype=attr_volume.dtype)
     attrs[raster.mask] = grid_sample_3d(
         attr_volume,
@@ -303,6 +322,8 @@ def _bake_maps_zyrex(
         grid=((query_positions - aabb[0]) / voxel_size).reshape(1, -1, 3),
         mode="trilinear",
     )
+    timings["sample_attr_volume"] = time.perf_counter() - t0
+    t0 = time.perf_counter()
     normal = bake_tangent_space_normal_map(
         vertices=out_vertices,
         faces=out_faces.long(),
@@ -310,6 +331,8 @@ def _bake_maps_zyrex(
         vertex_normals=out_normals_t,
         raster=raster,
     )
+    timings["bake_normal_map"] = time.perf_counter() - t0
+    t0 = time.perf_counter()
     pos_mapped = torch.zeros(texture_size, texture_size, 3, dtype=query_positions.dtype, device=query_positions.device)
     pos_mapped[raster.mask] = query_positions
 
@@ -319,11 +342,13 @@ def _bake_maps_zyrex(
     roughness = torch.clamp(attrs[..., attr_layout["roughness"]] * 255.0, 0.0, 255.0).byte().cpu().numpy()
     alpha = torch.clamp(attrs[..., attr_layout["alpha"]] * 255.0, 0.0, 255.0).byte().cpu().numpy()
     normal = torch.clamp(normal * 255.0, 0.0, 255.0).byte().cpu().numpy()
+    timings["quantize_maps"] = time.perf_counter() - t0
     return {
         "mask_raw": mask_np,
         "face_indices_raw": raster.face_indices.cpu().numpy().astype(np.int32),
         "sample_positions_raw": pos_mapped.cpu().numpy().astype(np.float32),
         "sampled_attrs_raw": attrs.cpu().numpy().astype(np.float32),
+        "timings": timings,
         "maps_raw": {
             "base_color": base_color,
             "metallic": metallic,
@@ -365,6 +390,8 @@ def bake_glb_maps_from_prepared(
         )
 
     mask_raw = baked["mask_raw"]
+    timings = dict(baked.get("timings", {}))
+    t0 = time.perf_counter()
     maps_raw = baked["maps_raw"]
     mask_inv = (~mask_raw).astype(np.uint8)
     base_color = cv2.inpaint(maps_raw["base_color"], mask_inv, 3, cv2.INPAINT_TELEA)
@@ -374,6 +401,7 @@ def bake_glb_maps_from_prepared(
     normal = maps_raw["normal"]
     if normal is not None:
         normal = cv2.inpaint(normal, mask_inv, 3, cv2.INPAINT_TELEA)
+    timings["inpaint_maps"] = time.perf_counter() - t0
 
     maps_filled: Dict[str, Any] = {
         "base_color": base_color,
@@ -389,6 +417,7 @@ def bake_glb_maps_from_prepared(
         "face_indices_raw": baked.get("face_indices_raw"),
         "sample_positions_raw": baked.get("sample_positions_raw"),
         "sampled_attrs_raw": baked.get("sampled_attrs_raw"),
+        "timings": timings,
         "maps_raw": maps_raw,
         "maps_filled": maps_filled,
     }

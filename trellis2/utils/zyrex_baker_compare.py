@@ -906,6 +906,7 @@ def run_gpu_comparison_voxel_input(
         times: list[float] = []
         allocs: list[float] = []
         reserveds: list[float] = []
+        stage_runs: list[Dict[str, float]] = []
         bakes = []
         for run_idx in range(3):
             _progress(f"gpu_voxel: {backend} measured run {run_idx + 1}/3", started)
@@ -917,14 +918,22 @@ def run_gpu_comparison_voxel_input(
             times.append(time.perf_counter() - t0)
             allocs.append(float(torch.cuda.max_memory_allocated() / (1024**2)))
             reserveds.append(float(torch.cuda.max_memory_reserved() / (1024**2)))
+            stage_runs.append({k: float(v) for k, v in baked.get("timings", {}).items()})
             bakes.append(baked)
 
         median_idx = int(np.argsort(np.array(times))[1])
+        stage_keys = sorted({k for run in stage_runs for k in run.keys()})
+        stage_medians = {
+            key: float(np.median(np.array([run.get(key, 0.0) for run in stage_runs], dtype=np.float64)))
+            for key in stage_keys
+        }
         return {
             "debug": bakes[median_idx],
             "times": times,
             "allocs": allocs,
             "reserveds": reserveds,
+            "stage_runs": stage_runs,
+            "stage_medians": stage_medians,
             "median_time": float(np.median(np.array(times))),
             "median_alloc": float(np.median(np.array(allocs))),
             "median_reserved": float(np.median(np.array(reserveds))),
@@ -1074,6 +1083,12 @@ def run_gpu_comparison_voxel_input(
             "zyrex_bake_only_median": zyx_runs["median_time"],
             "nvdiffrast_bake_only_runs": nvd_runs["times"],
             "zyrex_bake_only_runs": zyx_runs["times"],
+        },
+        "stage_timing_seconds": {
+            "nvdiffrast_median": nvd_runs["stage_medians"],
+            "zyrex_median": zyx_runs["stage_medians"],
+            "nvdiffrast_runs": nvd_runs["stage_runs"],
+            "zyrex_runs": zyx_runs["stage_runs"],
         },
         "peak_vram_mb": {
             "nvdiffrast_bake_only_allocated_median": nvd_runs["median_alloc"],
