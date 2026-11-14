@@ -125,22 +125,36 @@ Used by: `DinoV3FeatureExtractor` in `trellis2/modules/image_feature_extractor.p
 
 Commercial use / redistribution: **Unclear / unverified** from this audit; treat as restricted pending legal review.
 
-### 4.4 Background-removal model (gated default in HF pipeline config)
+### 4.4 Background-removal model (gated; non-default, research-only opt-in)
 
 Source repo: https://huggingface.co/briaai/RMBG-2.0  
 Status: **Gated**  
 License metadata: **other**
 
-Used by HF pipeline configs as `rembg_model.args.model_name = "briaai/RMBG-2.0"`.
+Referenced by upstream HF pipeline configs as `rembg_model.args.model_name = "briaai/RMBG-2.0"`.
+In this fork, default loading of this model is blocked unless explicit opt-in is provided via:
+
+- env flag: `TRELLIS2_ALLOW_NONCOMMERCIAL_RMBG=1`
+- and config explicitly pointing `rembg_model.args.model_name` at `briaai/RMBG-2.0`
 
 Commercial use / redistribution: **Unclear / unverified** from this audit; terms were inaccessible without gated access.
 
-### 4.5 Background-removal fallback class default (ungated)
+### 4.5 Background-removal default used by this fork (ungated, pinned)
 
 Source repo: https://huggingface.co/ZhengPeng7/BiRefNet  
 License metadata: **MIT**
 
-Used by: `BiRefNet` class default in `trellis2/pipelines/rembg/BiRefNet.py` (if no override is provided).
+Used by default in this fork via `trellis2/pipelines/rembg/BiRefNet.py` and
+`trellis2/pipelines/rembg/__init__.py`:
+
+- repo: `ZhengPeng7/BiRefNet`
+- pinned revision: `e2bf8e4460fc8fa32bba5ea4d94b3233d367b0e4`
+- license metadata: `MIT`
+
+Additional evaluated BiRefNet variants (not defaulted in pipeline config):
+
+- `ZhengPeng7/BiRefNet_dynamic` @ `280306042f57b7a33854319da62fd86aaa89ec4c` (license metadata: `MIT`)
+- `ZhengPeng7/BiRefNet_HR` @ `a7a562f6fd16021180f2f4348f4de003a2d3d1e1` (license metadata: `MIT`)
 
 Commercial use / redistribution: permissive per MIT metadata.
 

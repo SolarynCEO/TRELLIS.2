@@ -1,0 +1,58 @@
+{
+  "external_images": [
+    {
+      "id": "hair-portrait",
+      "filename": "hair-portrait.jpg",
+      "title": "Self Portrait - Hair",
+      "image_url": "https://live.staticflickr.com/2624/5831204632_7d82a13e3a_b.jpg",
+      "source_url": "https://www.flickr.com/photos/58724736@N00/5831204632",
+      "license": "CC BY 2.0",
+      "edge_case": "fine hair strands"
+    },
+    {
+      "id": "fur-cat",
+      "filename": "fur-cat.jpg",
+      "title": "Close-up of fluffy cat fur",
+      "image_url": "https://live.staticflickr.com/8679/15737054148_2824f846e9_b.jpg",
+      "source_url": "https://www.flickr.com/photos/26344495@N05/15737054148",
+      "license": "CC BY 2.0",
+      "edge_case": "dense fur texture"
+    },
+    {
+      "id": "thin-weapon",
+      "filename": "thin-weapon.jpg",
+      "title": "Ornate historical fencing sword",
+      "image_url": "https://images.rawpixel.com/editor_1024/cHJpdmF0ZS9sci9pbWFnZXMvd2Vic2l0ZS8yMDIzLTExL2xyL21ldDI3MzU3LWltYWdlLmpwZw.jpg",
+      "source_url": "https://www.rawpixel.com/image/12852191/rapier",
+      "license": "CC0 1.0",
+      "edge_case": "thin metallic geometry"
+    },
+    {
+      "id": "translucent-jellyfish",
+      "filename": "translucent-jellyfish.jpg",
+      "title": "Translucent Jellyfish",
+      "image_url": "https://live.staticflickr.com/3615/3329189393_4003e921c9.jpg",
+      "source_url": "https://www.flickr.com/photos/54455009@N00/3329189393",
+      "license": "CC BY 2.0",
+      "edge_case": "translucent boundaries"
+    },
+    {
+      "id": "dark-cat",
+      "filename": "dark-cat.jpg",
+      "title": "Black Cat, Dark Room",
+      "image_url": "https://live.staticflickr.com/766/23343368150_6ae115ca18_b.jpg",
+      "source_url": "https://www.flickr.com/photos/117241823@N04/23343368150",
+      "license": "CC BY-SA 2.0",
+      "edge_case": "dark subject on dark background"
+    },
+    {
+      "id": "glass-objects",
+      "filename": "glass-objects.jpg",
+      "title": "OBJETOS DE VIDRO (Glass Objects)",
+      "image_url": "https://live.staticflickr.com/2521/4162370527_3197a5f4b2_b.jpg",
+      "source_url": "https://www.flickr.com/photos/40279385@N08/4162370527",
+      "license": "CC BY-SA 2.0",
+      "edge_case": "transparent and reflective surfaces"
+    }
+  ]
+}

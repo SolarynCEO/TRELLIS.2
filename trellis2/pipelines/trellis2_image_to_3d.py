@@ -1,7 +1,6 @@
 from typing import *
 import torch
 import torch.nn as nn
-import numpy as np
 from PIL import Image
 from .base import Pipeline
 from . import samplers, rembg
@@ -102,7 +101,9 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         pipeline.tex_slat_normalization = args['tex_slat_normalization']
 
         pipeline.image_cond_model = getattr(image_feature_extractor, args['image_cond_model']['name'])(**args['image_cond_model']['args'])
-        pipeline.rembg_model = getattr(rembg, args['rembg_model']['name'])(**args['rembg_model']['args'])
+        rembg_config = rembg.resolve_rembg_config(args['rembg_model'])
+        pipeline.rembg_model = rembg.build_rembg_model(rembg_config)
+        args['rembg_model'] = rembg_config
         
         pipeline.low_vram = args.get('low_vram', True)
         pipeline.default_pipeline_type = args.get('default_pipeline_type', '1024_cascade')
@@ -128,38 +129,13 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         """
         Preprocess the input image.
         """
-        # if has alpha channel, use it directly; otherwise, remove background
-        has_alpha = False
-        if input.mode == 'RGBA':
-            alpha = np.array(input)[:, :, 3]
-            if not np.all(alpha == 255):
-                has_alpha = True
-        max_size = max(input.size)
-        scale = min(1, 1024 / max_size)
-        if scale < 1:
-            input = input.resize((int(input.width * scale), int(input.height * scale)), Image.Resampling.LANCZOS)
-        if has_alpha:
-            output = input
-        else:
-            input = input.convert('RGB')
-            if self.low_vram:
-                self.rembg_model.to(self.device)
-            output = self.rembg_model(input)
-            if self.low_vram:
-                self.rembg_model.cpu()
-        output_np = np.array(output)
-        alpha = output_np[:, :, 3]
-        bbox = np.argwhere(alpha > 0.8 * 255)
-        bbox = np.min(bbox[:, 1]), np.min(bbox[:, 0]), np.max(bbox[:, 1]), np.max(bbox[:, 0])
-        center = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
-        size = max(bbox[2] - bbox[0], bbox[3] - bbox[1])
-        size = int(size * 1)
-        bbox = center[0] - size // 2, center[1] - size // 2, center[0] + size // 2, center[1] + size // 2
-        output = output.crop(bbox)  # type: ignore
-        output = np.array(output).astype(np.float32) / 255
-        output = output[:, :, :3] * output[:, :, 3:4]
-        output = Image.fromarray((output * 255).astype(np.uint8))
-        return output
+        return rembg.preprocess_with_rembg(
+            input,
+            self.rembg_model,
+            device=str(self.device),
+            low_vram=self.low_vram,
+            warning_context=f"{self.__class__.__name__}.preprocess_image",
+        )
         
     def get_cond(self, image: Union[torch.Tensor, list[Image.Image]], resolution: int, include_neg_cond: bool = True) -> dict:
         """
