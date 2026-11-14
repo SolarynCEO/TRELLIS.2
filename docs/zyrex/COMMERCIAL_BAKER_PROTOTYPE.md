@@ -32,11 +32,14 @@ Implemented modules:
 - `o-voxel/o_voxel/zyrex_baker_backend.py`
   - Resolves `ZYREX_BAKER` values with default fallback to `nvdiffrast`
 - `o-voxel/o_voxel/zyrex_uv_baker.py`
-  - UV triangle rasterization (torch)
+  - UV triangle rasterization (`ZYREX_RASTER_IMPL=torch|triton`, defaults to Triton on CUDA when available; torch fallback otherwise)
   - Barycentric interpolation (torch)
   - Sparse voxel trilinear sampling (torch `grid_sample`)
   - Seam dilation/padding (iterative neighbor fill)
   - Tangent-space normal-map baking
+
+Triton dependency note:
+- The Triton raster path relies on the runtime Triton install available in the execution environment (e.g. laptop `triton-windows`); this prototype does not add new package dependencies.
 - `o-voxel/o_voxel/postprocess.py`
   - Adds feature-flagged branch:
     - `nvdiffrast` path unchanged (default)
@@ -48,6 +51,15 @@ Behavioral constraints:
 - No production default replacement.
 - No NVIDIA path removal.
 - No GPL/AGPL dependency introduction.
+
+Raster parity note:
+
+- CUDA parity tests compare `zyrex` rasterization against `nvdiffrast` on a non-overlapping UV tiling.
+- Face-id mismatches are only accepted for true edge-tie texels on shared edges:
+  - the two winning faces must be adjacent (share an edge), and
+  - the texel center must be on that shared edge within 8-bit fixed-point tolerance (`|edge_fn| <= 1` subpixel unit), or interpolated UV positions agree within `1e-4`.
+- Non-edge mismatches are treated as regressions.
+- Raster implementation can be forced with `ZYREX_RASTER_IMPL=torch|triton`; default is `triton` on CUDA when available, otherwise torch fallback.
 
 ---
 

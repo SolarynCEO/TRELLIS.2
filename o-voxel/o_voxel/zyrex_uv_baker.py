@@ -8,6 +8,15 @@ from typing import Callable, Dict, Optional, Sequence, Tuple
 import torch
 import torch.nn.functional as F
 
+try:
+    import triton
+    import triton.language as tl
+    _TRITON_AVAILABLE = True
+except Exception:
+    triton = None
+    tl = None
+    _TRITON_AVAILABLE = False
+
 
 @dataclass
 class UVRasterization:
@@ -32,7 +41,18 @@ def _to_texture_hw(texture_size: int | Sequence[int]) -> Tuple[int, int]:
     return int(texture_size[0]), int(texture_size[1])
 
 
-def rasterize_uv_triangles(
+def _resolve_raster_impl(device: torch.device) -> str:
+    requested = os.environ.get("ZYREX_RASTER_IMPL", "").strip().lower()
+    if requested in {"torch", "triton"}:
+        if requested == "triton" and (device.type != "cuda" or not _TRITON_AVAILABLE):
+            return "torch"
+        return requested
+    if device.type == "cuda" and _TRITON_AVAILABLE:
+        return "triton"
+    return "torch"
+
+
+def _rasterize_uv_triangles_torch(
     uvs: torch.Tensor,
     faces: torch.Tensor,
     texture_size: int | Sequence[int],
@@ -261,6 +281,309 @@ def rasterize_uv_triangles(
     timings_out = timings if profiling_enabled else None
     stats_out = stats if profiling_enabled else None
     return UVRasterization(mask=mask, face_indices=face_indices, barycentric=barycentric, timings=timings_out, stats=stats_out)
+
+
+if _TRITON_AVAILABLE:
+    @triton.jit
+    def _rasterize_tile_atomic_min_kernel(
+        face_for_tile_ptr,
+        tile_local_ptr,
+        global_face_ptr,
+        min_x_ptr,
+        min_y_ptr,
+        max_x_ptr,
+        max_y_ptr,
+        tiles_w_ptr,
+        v0x_ptr,
+        v0y_ptr,
+        v1x_ptr,
+        v1y_ptr,
+        v2x_ptr,
+        v2y_ptr,
+        include_e0_ptr,
+        include_e1_ptr,
+        include_e2_ptr,
+        out_face_ptr,
+        width: tl.constexpr,
+        height: tl.constexpr,
+        subpixel_scale: tl.constexpr,
+        TILE_W: tl.constexpr,
+        TILE_H: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        face_local = tl.load(face_for_tile_ptr + pid)
+        tile_local = tl.load(tile_local_ptr + pid)
+        face_global = tl.load(global_face_ptr + face_local)
+
+        tiles_w = tl.load(tiles_w_ptr + face_local)
+        tile_x = tile_local % tiles_w
+        tile_y = tile_local // tiles_w
+
+        min_x = tl.load(min_x_ptr + face_local)
+        min_y = tl.load(min_y_ptr + face_local)
+        max_x = tl.load(max_x_ptr + face_local)
+        max_y = tl.load(max_y_ptr + face_local)
+
+        x0 = min_x + tile_x * TILE_W
+        y0 = min_y + tile_y * TILE_H
+
+        xs = x0 + tl.arange(0, TILE_W)
+        ys = y0 + tl.arange(0, TILE_H)
+        x = tl.broadcast_to(xs[None, :], [TILE_H, TILE_W])
+        y = tl.broadcast_to(ys[:, None], [TILE_H, TILE_W])
+
+        valid = (x <= max_x) & (y <= max_y) & (x >= 0) & (y >= 0) & (x < width) & (y < height)
+        if not tl.any(valid):
+            return
+
+        xfp = x.to(tl.int64) * subpixel_scale
+        yfp = y.to(tl.int64) * subpixel_scale
+
+        v0x = tl.load(v0x_ptr + face_local)
+        v0y = tl.load(v0y_ptr + face_local)
+        v1x = tl.load(v1x_ptr + face_local)
+        v1y = tl.load(v1y_ptr + face_local)
+        v2x = tl.load(v2x_ptr + face_local)
+        v2y = tl.load(v2y_ptr + face_local)
+        include_e0 = tl.load(include_e0_ptr + face_local).to(tl.int1)
+        include_e1 = tl.load(include_e1_ptr + face_local).to(tl.int1)
+        include_e2 = tl.load(include_e2_ptr + face_local).to(tl.int1)
+
+        e0 = (xfp - v1x) * (v2y - v1y) - (yfp - v1y) * (v2x - v1x)
+        e1 = (xfp - v2x) * (v0y - v2y) - (yfp - v2y) * (v0x - v2x)
+        e2 = (xfp - v0x) * (v1y - v0y) - (yfp - v0y) * (v1x - v0x)
+
+        in0 = (e0 < 0) | ((e0 == 0) & include_e0)
+        in1 = (e1 < 0) | ((e1 == 0) & include_e1)
+        in2 = (e2 < 0) | ((e2 == 0) & include_e2)
+        inside = valid & in0 & in1 & in2
+        if not tl.any(inside):
+            return
+
+        pix = y * width + x
+        tl.atomic_min(out_face_ptr + pix, face_global, mask=inside)
+
+
+def _rasterize_uv_triangles_triton(
+    uvs: torch.Tensor,
+    faces: torch.Tensor,
+    texture_size: int | Sequence[int],
+    eps: float = 1e-6,
+    face_chunk_size: Optional[int] = None,
+    max_candidates_per_chunk: Optional[int] = None,
+) -> UVRasterization:
+    if not _TRITON_AVAILABLE:
+        raise RuntimeError("Triton is not available")
+    if uvs.device.type != "cuda":
+        raise RuntimeError("Triton rasterizer requires CUDA tensors")
+
+    height, width = _to_texture_hw(texture_size)
+    device = uvs.device
+    dtype = uvs.dtype
+    if face_chunk_size is None:
+        face_chunk_size = 4096 if _is_truthy(os.environ.get("ZYREX_LOW_VRAM")) else 16384
+    if max_candidates_per_chunk is None:
+        max_candidates_per_chunk = 4_000_000 if _is_truthy(os.environ.get("ZYREX_LOW_VRAM")) else 16_000_000
+    subpixel_bits = 8
+    subpixel_scale = 1 << subpixel_bits
+    area_eps = max(1, int(round(eps * (subpixel_scale**2))))
+    tile_w = 8
+    tile_h = 8
+
+    faces_long = faces.long()
+    uvs_px = uvs[:, :2].to(torch.float32).clone()
+    uvs_px[:, 0] = uvs_px[:, 0] * width - 0.5
+    uvs_px[:, 1] = uvs_px[:, 1] * height - 0.5
+    tris = uvs_px[faces_long]
+    tris_fp = torch.floor(tris * subpixel_scale + 0.5).to(torch.int64)
+
+    max_face = torch.iinfo(torch.int32).max
+    face_map = torch.full((height * width,), max_face, dtype=torch.int32, device=device)
+
+    def ceil_div(v: torch.Tensor, s: int) -> torch.Tensor:
+        return -torch.div(-v, s, rounding_mode="floor")
+
+    stats: Dict[str, int] = {
+        "chunks": 0,
+        "candidate_count_total": 0,
+        "inside_count_total": 0,
+        "valid_pixel_total": 0,
+    }
+
+    total_faces = tris_fp.shape[0]
+    start = 0
+    while start < total_faces:
+        stats["chunks"] += 1
+        tentative_end = min(start + int(face_chunk_size), total_faces)
+        while True:
+            tri_chunk = tris_fp[start:tentative_end]
+            min_x = ceil_div(torch.min(tri_chunk[..., 0], dim=1).values, subpixel_scale).long().clamp(0, width - 1)
+            max_x = torch.div(torch.max(tri_chunk[..., 0], dim=1).values, subpixel_scale, rounding_mode="floor").long().clamp(0, width - 1)
+            min_y = ceil_div(torch.min(tri_chunk[..., 1], dim=1).values, subpixel_scale).long().clamp(0, height - 1)
+            max_y = torch.div(torch.max(tri_chunk[..., 1], dim=1).values, subpixel_scale, rounding_mode="floor").long().clamp(0, height - 1)
+            widths = max_x - min_x + 1
+            heights = max_y - min_y + 1
+            valid_bbox = (widths > 0) & (heights > 0)
+            if not valid_bbox.any():
+                break
+            areas = widths[valid_bbox] * heights[valid_bbox]
+            num_candidates = int(areas.sum().item())
+            if num_candidates <= int(max_candidates_per_chunk) or tentative_end - start <= 1:
+                break
+            tentative_end = start + max(1, (tentative_end - start) // 2)
+
+        tri_chunk = tris_fp[start:tentative_end]
+        area = (tri_chunk[:, 1, 0] - tri_chunk[:, 0, 0]) * (tri_chunk[:, 2, 1] - tri_chunk[:, 0, 1]) - (
+            tri_chunk[:, 1, 1] - tri_chunk[:, 0, 1]
+        ) * (tri_chunk[:, 2, 0] - tri_chunk[:, 0, 0])
+        swap = area < 0
+        if swap.any():
+            tri_chunk = tri_chunk.clone()
+            v1 = tri_chunk[:, 1].clone()
+            v2 = tri_chunk[:, 2].clone()
+            tri_chunk[:, 1] = torch.where(swap[:, None], v2, v1)
+            tri_chunk[:, 2] = torch.where(swap[:, None], v1, v2)
+            area = torch.abs(area)
+        nondeg = area >= area_eps
+
+        min_x = ceil_div(torch.min(tri_chunk[..., 0], dim=1).values, subpixel_scale).long().clamp(0, width - 1)
+        max_x = torch.div(torch.max(tri_chunk[..., 0], dim=1).values, subpixel_scale, rounding_mode="floor").long().clamp(0, width - 1)
+        min_y = ceil_div(torch.min(tri_chunk[..., 1], dim=1).values, subpixel_scale).long().clamp(0, height - 1)
+        max_y = torch.div(torch.max(tri_chunk[..., 1], dim=1).values, subpixel_scale, rounding_mode="floor").long().clamp(0, height - 1)
+        widths = max_x - min_x + 1
+        heights = max_y - min_y + 1
+        valid = (widths > 0) & (heights > 0) & nondeg
+        if not valid.any():
+            start = tentative_end
+            continue
+
+        local_ids = torch.nonzero(valid, as_tuple=False).squeeze(1)
+        tri_valid = tri_chunk[local_ids]
+        min_x_v = min_x[local_ids].to(torch.int32)
+        min_y_v = min_y[local_ids].to(torch.int32)
+        max_x_v = max_x[local_ids].to(torch.int32)
+        max_y_v = max_y[local_ids].to(torch.int32)
+        widths_v = widths[local_ids]
+        heights_v = heights[local_ids]
+        stats["candidate_count_total"] += int((widths_v * heights_v).sum().item())
+
+        v0 = tri_valid[:, 0]
+        v1 = tri_valid[:, 1]
+        v2 = tri_valid[:, 2]
+
+        def edge_top_left(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            dx = b[:, 0] - a[:, 0]
+            dy = b[:, 1] - a[:, 1]
+            return (dy > 0) | ((dy == 0) & (dx < 0))
+
+        tl0 = edge_top_left(v1, v2)
+        tl1 = edge_top_left(v2, v0)
+        tl2 = edge_top_left(v0, v1)
+        include_e0 = (~tl0).to(torch.int32)
+        include_e1 = (~tl1).to(torch.int32)
+        include_e2 = (~tl2).to(torch.int32)
+
+        tiles_w = ((widths_v + (tile_w - 1)) // tile_w).to(torch.int32)
+        tiles_h = ((heights_v + (tile_h - 1)) // tile_h).to(torch.int32)
+        tile_counts = (tiles_w * tiles_h).to(torch.long)
+        total_tiles = int(tile_counts.sum().item())
+        if total_tiles == 0:
+            start = tentative_end
+            continue
+
+        local_face_idx = torch.arange(local_ids.shape[0], device=device, dtype=torch.int32)
+        face_for_tile = torch.repeat_interleave(local_face_idx, tile_counts)
+        offsets = torch.cumsum(tile_counts, dim=0) - tile_counts
+        offsets_rep = torch.repeat_interleave(offsets, tile_counts)
+        tile_local = (torch.arange(total_tiles, device=device, dtype=torch.long) - offsets_rep).to(torch.int32)
+        global_faces = (start + local_ids).to(torch.int32)
+
+        grid = (total_tiles,)
+        _rasterize_tile_atomic_min_kernel[grid](
+            face_for_tile,
+            tile_local,
+            global_faces,
+            min_x_v,
+            min_y_v,
+            max_x_v,
+            max_y_v,
+            tiles_w,
+            v0[:, 0],
+            v0[:, 1],
+            v1[:, 0],
+            v1[:, 1],
+            v2[:, 0],
+            v2[:, 1],
+            include_e0,
+            include_e1,
+            include_e2,
+            face_map,
+            width=width,
+            height=height,
+            subpixel_scale=subpixel_scale,
+            TILE_W=tile_w,
+            TILE_H=tile_h,
+        )
+        start = tentative_end
+
+    face_indices = face_map.view(height, width)
+    mask = face_indices != max_face
+    face_indices = torch.where(mask, face_indices, torch.full_like(face_indices, -1))
+    stats["valid_pixel_total"] = int(mask.sum().item())
+
+    barycentric = torch.zeros((height, width, 3), dtype=dtype, device=device)
+    if mask.any():
+        rows, cols = torch.nonzero(mask, as_tuple=True)
+        face_ids = face_indices[rows, cols].long()
+        tri = tris[face_ids]
+        x = cols.to(torch.float32)
+        y = rows.to(torch.float32)
+        v0 = tri[:, 0]
+        v1 = tri[:, 1]
+        v2 = tri[:, 2]
+        area = (v1[:, 0] - v0[:, 0]) * (v2[:, 1] - v0[:, 1]) - (v1[:, 1] - v0[:, 1]) * (v2[:, 0] - v0[:, 0])
+        safe_area = torch.where(area.abs() > 1e-20, area, torch.ones_like(area))
+        e0 = (x - v1[:, 0]) * (v2[:, 1] - v1[:, 1]) - (y - v1[:, 1]) * (v2[:, 0] - v1[:, 0])
+        e1 = (x - v2[:, 0]) * (v0[:, 1] - v2[:, 1]) - (y - v2[:, 1]) * (v0[:, 0] - v2[:, 0])
+        e2 = (x - v0[:, 0]) * (v1[:, 1] - v0[:, 1]) - (y - v0[:, 1]) * (v1[:, 0] - v0[:, 0])
+        w0 = -e0 / safe_area
+        w1 = -e1 / safe_area
+        w2 = -e2 / safe_area
+        barycentric[rows, cols] = torch.stack([w0, w1, w2], dim=-1).to(dtype=dtype)
+
+    return UVRasterization(mask=mask, face_indices=face_indices, barycentric=barycentric, timings=None, stats=stats)
+
+
+def rasterize_uv_triangles(
+    uvs: torch.Tensor,
+    faces: torch.Tensor,
+    texture_size: int | Sequence[int],
+    eps: float = 1e-6,
+    face_chunk_size: Optional[int] = None,
+    max_candidates_per_chunk: Optional[int] = None,
+) -> UVRasterization:
+    impl = _resolve_raster_impl(uvs.device)
+    if impl == "triton":
+        try:
+            return _rasterize_uv_triangles_triton(
+                uvs=uvs,
+                faces=faces,
+                texture_size=texture_size,
+                eps=eps,
+                face_chunk_size=face_chunk_size,
+                max_candidates_per_chunk=max_candidates_per_chunk,
+            )
+        except Exception:
+            if os.environ.get("ZYREX_RASTER_IMPL", "").strip().lower() == "triton":
+                raise
+    return _rasterize_uv_triangles_torch(
+        uvs=uvs,
+        faces=faces,
+        texture_size=texture_size,
+        eps=eps,
+        face_chunk_size=face_chunk_size,
+        max_candidates_per_chunk=max_candidates_per_chunk,
+    )
 
 
 def interpolate_vertex_attributes(
