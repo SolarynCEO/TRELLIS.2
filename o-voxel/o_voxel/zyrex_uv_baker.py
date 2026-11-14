@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+import time
 from typing import Callable, Dict, Optional, Sequence, Tuple
 
 import torch
@@ -13,6 +14,8 @@ class UVRasterization:
     mask: torch.Tensor
     face_indices: torch.Tensor
     barycentric: torch.Tensor
+    timings: Optional[Dict[str, float]] = None
+    stats: Optional[Dict[str, int]] = None
 
 
 def _is_truthy(value: Optional[str]) -> bool:
@@ -50,6 +53,34 @@ def rasterize_uv_triangles(
     subpixel_bits = 8
     subpixel_scale = 1 << subpixel_bits
     area_eps = max(1, int(round(eps * (subpixel_scale**2))))
+    profiling_enabled = True
+    profile_sync = profiling_enabled and _is_truthy(os.environ.get("ZYREX_RASTER_PROFILE_SYNC")) and device.type == "cuda"
+
+    timings: Dict[str, float] = {
+        "bbox": 0.0,
+        "candidate_gen": 0.0,
+        "edge_eval": 0.0,
+        "winner_select": 0.0,
+        "merge_update": 0.0,
+    }
+    stats: Dict[str, int] = {
+        "chunks": 0,
+        "candidate_count_total": 0,
+        "inside_count_total": 0,
+        "valid_pixel_total": 0,
+    }
+
+    def _start_timer() -> float:
+        if profile_sync:
+            torch.cuda.synchronize()
+        return time.perf_counter()
+
+    def _stop_timer(stage: str, start_time: float) -> None:
+        if not profiling_enabled:
+            return
+        if profile_sync:
+            torch.cuda.synchronize()
+        timings[stage] += time.perf_counter() - start_time
 
     faces_long = faces.long()
     uvs_px = uvs[:, :2].to(dtype=torch.float32).clone()
@@ -58,22 +89,31 @@ def rasterize_uv_triangles(
     uvs_px[:, 0] = uvs_px[:, 0] * width - 0.5
     uvs_px[:, 1] = uvs_px[:, 1] * height - 0.5
     tris = uvs_px[faces_long]  # [F, 3, 2]
-    tris_fp = torch.round(tris * subpixel_scale).to(torch.int64)
+    # nvdiffrast-style fixed-point snapping in screen space (8 subpixel bits).
+    tris_fp = torch.floor(tris * subpixel_scale + 0.5).to(torch.int64)
 
     num_pixels = height * width
     best_face = torch.full((num_pixels,), -1, dtype=torch.int32, device=device)
     best_bary = torch.zeros((num_pixels, 3), dtype=dtype, device=device)
+    chunk_min_face = torch.empty((num_pixels,), dtype=torch.int32, device=device)
+    chunk_best_idx = torch.empty((num_pixels,), dtype=torch.long, device=device)
+
+    def ceil_div(v: torch.Tensor, s: int) -> torch.Tensor:
+        return -torch.div(-v, s, rounding_mode="floor")
 
     total_faces = tris.shape[0]
     start = 0
+    max_face_i32 = torch.iinfo(torch.int32).max
+    max_idx_i64 = torch.iinfo(torch.int64).max
     while start < total_faces:
+        stats["chunks"] += 1
         tentative_end = min(start + face_chunk_size, total_faces)
         while True:
             tri_chunk_fp = tris_fp[start:tentative_end]
-            min_x = torch.ceil(torch.min(tri_chunk_fp[..., 0], dim=1).values.to(torch.float32) / subpixel_scale).long().clamp(0, width - 1)
-            max_x = torch.floor(torch.max(tri_chunk_fp[..., 0], dim=1).values.to(torch.float32) / subpixel_scale).long().clamp(0, width - 1)
-            min_y = torch.ceil(torch.min(tri_chunk_fp[..., 1], dim=1).values.to(torch.float32) / subpixel_scale).long().clamp(0, height - 1)
-            max_y = torch.floor(torch.max(tri_chunk_fp[..., 1], dim=1).values.to(torch.float32) / subpixel_scale).long().clamp(0, height - 1)
+            min_x = ceil_div(torch.min(tri_chunk_fp[..., 0], dim=1).values, subpixel_scale).long().clamp(0, width - 1)
+            max_x = torch.div(torch.max(tri_chunk_fp[..., 0], dim=1).values, subpixel_scale, rounding_mode="floor").long().clamp(0, width - 1)
+            min_y = ceil_div(torch.min(tri_chunk_fp[..., 1], dim=1).values, subpixel_scale).long().clamp(0, height - 1)
+            max_y = torch.div(torch.max(tri_chunk_fp[..., 1], dim=1).values, subpixel_scale, rounding_mode="floor").long().clamp(0, height - 1)
             widths = max_x - min_x + 1
             heights = max_y - min_y + 1
             valid_bbox = (widths > 0) & (heights > 0)
@@ -85,18 +125,21 @@ def rasterize_uv_triangles(
                 break
             tentative_end = start + max(1, (tentative_end - start) // 2)
 
+        t = _start_timer()
         tri_chunk_fp = tris_fp[start:tentative_end]
-        min_x = torch.ceil(torch.min(tri_chunk_fp[..., 0], dim=1).values.to(torch.float32) / subpixel_scale).long().clamp(0, width - 1)
-        max_x = torch.floor(torch.max(tri_chunk_fp[..., 0], dim=1).values.to(torch.float32) / subpixel_scale).long().clamp(0, width - 1)
-        min_y = torch.ceil(torch.min(tri_chunk_fp[..., 1], dim=1).values.to(torch.float32) / subpixel_scale).long().clamp(0, height - 1)
-        max_y = torch.floor(torch.max(tri_chunk_fp[..., 1], dim=1).values.to(torch.float32) / subpixel_scale).long().clamp(0, height - 1)
+        min_x = ceil_div(torch.min(tri_chunk_fp[..., 0], dim=1).values, subpixel_scale).long().clamp(0, width - 1)
+        max_x = torch.div(torch.max(tri_chunk_fp[..., 0], dim=1).values, subpixel_scale, rounding_mode="floor").long().clamp(0, width - 1)
+        min_y = ceil_div(torch.min(tri_chunk_fp[..., 1], dim=1).values, subpixel_scale).long().clamp(0, height - 1)
+        max_y = torch.div(torch.max(tri_chunk_fp[..., 1], dim=1).values, subpixel_scale, rounding_mode="floor").long().clamp(0, height - 1)
         widths = max_x - min_x + 1
         heights = max_y - min_y + 1
         valid_bbox = (widths > 0) & (heights > 0)
+        _stop_timer("bbox", t)
         if not valid_bbox.any():
             start = tentative_end
             continue
 
+        t = _start_timer()
         local_face_ids = torch.nonzero(valid_bbox, as_tuple=False).squeeze(1)
         tri_valid_fp = tri_chunk_fp[local_face_ids]
         min_x_v = min_x[local_face_ids]
@@ -105,6 +148,7 @@ def rasterize_uv_triangles(
         heights_v = heights[local_face_ids]
         areas_v = widths_v * heights_v
         total_candidates = int(areas_v.sum().item())
+        stats["candidate_count_total"] += total_candidates
         if total_candidates == 0:
             start = tentative_end
             continue
@@ -124,7 +168,9 @@ def rasterize_uv_triangles(
         y_int = min_y_rep + y_local
         x = x_int.to(torch.int64) * subpixel_scale
         y = y_int.to(torch.int64) * subpixel_scale
+        _stop_timer("candidate_gen", t)
 
+        t = _start_timer()
         tri = tri_valid_fp[compact_rep]
         v0 = tri[:, 0]
         v1 = tri[:, 1]
@@ -162,10 +208,14 @@ def rasterize_uv_triangles(
             & ((e1 < 0) | ((e1 == 0) & tl1))
             & ((e2 < 0) | ((e2 == 0) & tl2))
         )
+        inside_count = int(inside.sum().item())
+        stats["inside_count_total"] += inside_count
+        _stop_timer("edge_eval", t)
         if not inside.any():
             start = tentative_end
             continue
 
+        t = _start_timer()
         compact_rep = compact_rep[inside]
         pix_idx = y_int[inside] * width + x_int[inside]
         face_idx = (start + local_face_ids[compact_rep]).to(torch.int32)
@@ -182,31 +232,42 @@ def rasterize_uv_triangles(
             b2 = bary[:, 2].clone()
             bary[:, 1] = torch.where(swapped_inside, b2, b1)
             bary[:, 2] = torch.where(swapped_inside, b1, b2)
+        large_idx = face_idx.shape[0]
+        chunk_min_face.fill_(max_face_i32)
+        chunk_min_face.scatter_reduce_(0, pix_idx, face_idx, reduce="amin", include_self=True)
+        is_best_face = face_idx == chunk_min_face[pix_idx]
+        cand_idx = torch.arange(face_idx.shape[0], device=device, dtype=torch.long)
+        idx_for_pix = torch.where(is_best_face, cand_idx, torch.full_like(cand_idx, max_idx_i64))
+        chunk_best_idx.fill_(max_idx_i64)
+        chunk_best_idx.scatter_reduce_(0, pix_idx, idx_for_pix, reduce="amin", include_self=True)
+        valid_pix = chunk_best_idx < max_idx_i64
+        chosen_pix = torch.nonzero(valid_pix, as_tuple=False).squeeze(1)
+        if chosen_pix.numel() == 0:
+            start = tentative_end
+            continue
+        stats["valid_pixel_total"] += int(chosen_pix.numel())
+        chosen_idx = chunk_best_idx[chosen_pix]
+        chosen_face = face_idx[chosen_idx]
+        chosen_bary = bary[chosen_idx]
+        _stop_timer("winner_select", t)
 
-        sort_key = pix_idx.to(torch.int64) * total_faces + face_idx.to(torch.int64)
-        order = torch.argsort(sort_key)
-        pix_sorted = pix_idx[order]
-        face_sorted = face_idx[order]
-        bary_sorted = bary[order]
-        keep = torch.ones_like(pix_sorted, dtype=torch.bool)
-        keep[1:] = pix_sorted[1:] != pix_sorted[:-1]
-        chosen_pix = pix_sorted[keep]
-        chosen_face = face_sorted[keep]
-        chosen_bary = bary_sorted[keep]
-
+        t = _start_timer()
         prev_face = best_face[chosen_pix]
         better = (prev_face < 0) | (chosen_face < prev_face)
         if better.any():
             update_pix = chosen_pix[better]
             best_face[update_pix] = chosen_face[better]
             best_bary[update_pix] = chosen_bary[better]
+        _stop_timer("merge_update", t)
 
         start = tentative_end
 
     face_indices = best_face.view(height, width)
     barycentric = best_bary.view(height, width, 3)
     mask = face_indices >= 0
-    return UVRasterization(mask=mask, face_indices=face_indices, barycentric=barycentric)
+    timings_out = timings if profiling_enabled else None
+    stats_out = stats if profiling_enabled else None
+    return UVRasterization(mask=mask, face_indices=face_indices, barycentric=barycentric, timings=timings_out, stats=stats_out)
 
 
 def interpolate_vertex_attributes(

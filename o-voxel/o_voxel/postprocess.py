@@ -313,6 +313,9 @@ def _bake_maps_zyrex(
     t0 = time.perf_counter()
     raster = rasterize_uv_triangles(out_uvs, out_faces.long(), texture_size)
     timings["rasterize_uv"] = time.perf_counter() - t0
+    if raster.timings is not None:
+        for key, value in raster.timings.items():
+            timings[f"raster_core_{key}"] = float(value)
     t0 = time.perf_counter()
     query_positions = interpolate_masked_vertex_attributes(out_vertices, out_faces.long(), raster)
     timings["interpolate_uv_to_pos"] = time.perf_counter() - t0
@@ -360,6 +363,7 @@ def _bake_maps_zyrex(
         "sample_positions_raw": pos_mapped.cpu().numpy().astype(np.float32),
         "sampled_attrs_raw": attrs.cpu().numpy().astype(np.float32),
         "timings": timings,
+        "rasterizer_stats": raster.stats,
         "maps_raw": {
             "base_color": base_color,
             "metallic": metallic,
@@ -430,6 +434,7 @@ def bake_glb_maps_from_prepared(
         "face_indices_raw": baked.get("face_indices_raw"),
         "sample_positions_raw": baked.get("sample_positions_raw"),
         "sampled_attrs_raw": baked.get("sampled_attrs_raw"),
+        "rasterizer_stats": baked.get("rasterizer_stats"),
         "timings": timings,
         "maps_raw": maps_raw,
         "maps_filled": maps_filled,

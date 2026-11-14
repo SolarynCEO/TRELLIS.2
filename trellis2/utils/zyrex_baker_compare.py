@@ -1090,6 +1090,10 @@ def run_gpu_comparison_voxel_input(
             "nvdiffrast_runs": nvd_runs["stage_runs"],
             "zyrex_runs": zyx_runs["stage_runs"],
         },
+        "rasterizer_stats": {
+            "nvdiffrast": nvd_dbg.get("rasterizer_stats"),
+            "zyrex": zyx_dbg.get("rasterizer_stats"),
+        },
         "peak_vram_mb": {
             "nvdiffrast_bake_only_allocated_median": nvd_runs["median_alloc"],
             "nvdiffrast_bake_only_reserved_median": nvd_runs["median_reserved"],
