@@ -1,4 +1,4 @@
-# TRELLIS.2 Low-VRAM Mode (`8gb`) for Zyrex Fork
+# TRELLIS.2 Low-VRAM Profiles for Zyrex Fork
 
 This fork adds an opt-in low-VRAM profile intended to make image-to-3D generation practical on GPUs with 8 GB VRAM (for example, RTX 4070 Laptop GPUs), while keeping default behavior unchanged unless explicitly enabled.
 
@@ -33,7 +33,7 @@ When `vram_profile="8gb"` is active, the pipeline:
 
 ## Default behavior compatibility
 
-- If you do **not** set `ZYREX_LOW_VRAM` and do **not** pass `vram_profile`, behavior remains unchanged from this fork's prior default path.
+- If you do **not** set `ZYREX_LOW_VRAM` or `ZYREX_VRAM_PROFILE` and do **not** pass `vram_profile`, behavior remains unchanged from this fork's prior default path.
 - Existing calls to `pipeline.run(...)` still work.
 
 ## Quality / speed tradeoffs
@@ -143,3 +143,135 @@ These are included in `requirements.txt` and `setup.sh --basic`.
 ## Important measurement note
 
 This repository's cloud CPU VM cannot produce real CUDA VRAM numbers. Treat all VRAM fit claims as **pending** until you run the benchmark on your target GPU and inspect the emitted JSON.
+
+## Experimental explicit 1024 cascade profile
+
+`pipeline.run(image, vram_profile="8gb_1024", return_metrics=True)` selects
+**1024_cascade without a 512 fallback**. Alternatively set
+`ZYREX_VRAM_PROFILE=8gb_1024` before creating/running the pipeline. An explicit
+`vram_profile="none"` disables environment profile selection. The existing
+`ZYREX_LOW_VRAM=1` / `8gb` behavior still defaults to 512.
+
+For app integration, set legacy offloading **before** moving the pipeline's
+execution device, so an all-model upload cannot OOM before `run()` starts:
+
+```python
+pipeline.low_vram = True
+pipeline.cuda()
+meshes, metrics = pipeline.run(image, vram_profile="8gb_1024", return_metrics=True)
+assert metrics["output_resolution"] == 1024
+```
+
+The goal is at most **6.5 GiB peak reserved**, leaving headroom on an 8 GB GPU.
+**This target is unverified. No GPU generation, bake, quality comparison, or
+per-stage VRAM measurements were run for this change.** The profile is a candidate
+for laptop validation, not a guarantee that all images fit. A token cap or OOM
+failure is not a successful 1024 result.
+
+The opt-in profile:
+
+- Evicts idle models to CPU at entry and keeps sequential stage offloading.
+  It offloads models even if a caller previously placed them all on CUDA.
+- Disables Euler sampler prediction history. Ordinary sampler calls retain history.
+- Releases the low-resolution shape and upsampling intermediates before the
+  high-resolution flow, moves inactive high-resolution conditioning to CPU, and
+  drops conditioning and unrequested latents before later decodes.
+- Streams sparse decoder modules (input projection, each block, output projection)
+  to the execution device and back to CPU, including failed forwards. This can
+  substantially increase CPU transfer time and requires sufficient host RAM.
+- Chunks only the independent rows of the final layer-norm/linear projection.
+  `decoder_chunk_size=32768` is the default; override with the runtime argument or
+  `ZYREX_DECODER_CHUNK_SIZE`. Sparse convolutions, their caches, and mesh extraction
+  remain whole to preserve neighborhood/topology correctness.
+- Keeps decoder precision as configured in the checkpoint. Flow/conditioning
+  autocast defaults to fp16, as in `8gb`; `ZYREX_LOW_VRAM_DTYPE=none|fp16|bf16`
+  controls it. Numerical/visual parity still needs real validation.
+- Rejects multiple samples, conflicting pipeline types, invalid chunk sizes, and
+  a high-resolution token count above `max_num_tokens` (default 49152). It never
+  silently lowers resolution or discards tokens. Raising this cap increases risk.
+- Releases allocator caches between stages and streamed blocks. Configure
+  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` **before importing torch**.
+  Some Windows/PyTorch builds may warn that this is unsupported; the report records
+  the requested configuration, not proof it took effect.
+
+The original pipeline settings and temporary decoder attributes are restored on
+exit. Optimized runs leave models on CPU for baking; a subsequent run with profile
+disabled and `low_vram=False` restores full model residency automatically. For
+standalone calls to pipeline submethods after an optimized run, call `.to(device)`
+first if using `low_vram=False`. `return_latent=True` retains the requested latents
+and can increase peak memory; the benchmark uses the default `False`.
+
+### Stage profiling and failure reports
+
+`profile_stages=True` enables detailed profiling for `1024_cascade` with either
+`vram_profile="none"` (original cascade) or `"8gb_1024"`. Records include:
+conditioning at 512/1024, sparse structure, shape SLat at 512, cascade upsampling,
+shape SLat at 1024, texture SLat, shape decode, mesh extraction, texture decode,
+and mesh finalization. The optimized path also records coordinate quantization.
+Parent stage peaks include their children; **do not sum peaks or nested timings**.
+
+`scripts/profile_1024_vram.py` additionally measures model loading, mesh
+simplification, **bake**, and export. It writes `metrics.json` on success or failure
+after torch has imported, including completed stages and the failing stage when
+available. CUDA timings are synchronized. CPU counters are null. The report's
+`target_met` requires a completed 1024 output and an overall peak reserved at most
+6.5 GiB, including bake. `pipeline.last_run_stats` alone covers generation only.
+Metrics measure **PyTorch's allocator**, not direct native CUDA allocations or
+other processes; also observe total GPU usage on the laptop.
+
+### Exact laptop validation commands (PowerShell)
+
+Run baseline first, then optimized, in separate Python processes. Choose the same
+local warlord image when prompted. Neither the image nor generated outputs belong
+in a commit. These commands use existing TRELLIS.2 weights; no weights are modified.
+
+```powershell
+Set-Location C:\dev\TRELLIS.2
+git fetch origin feat/low-vram-1024
+git switch --create validate/low-vram-1024 --track origin/feat/low-vram-1024
+$warlordImage = Read-Host 'Absolute path to the local warlord image'
+Remove-Item Env:CUDA_VISIBLE_DEVICES -ErrorAction SilentlyContinue
+Remove-Item Env:ZYREX_LOW_VRAM_DTYPE -ErrorAction SilentlyContinue
+Remove-Item Env:PYTORCH_ALLOC_CONF -ErrorAction SilentlyContinue
+$env:PYTORCH_CUDA_ALLOC_CONF = 'expandable_segments:True'
+$env:ZYREX_RASTER_IMPL = 'torch'
+
+# Baseline with legacy low_vram OFF. It may OOM; keep metrics.json if so.
+& C:\dev\TRELLIS.2\.venv\Scripts\python.exe scripts\profile_1024_vram.py `
+  --image $warlordImage --vram-profile none --low-vram off `
+  --baker zyrex --seed 42 --texture-size 2048 --decimation-target 500000 `
+  --output-dir outputs\vram1024-baseline
+
+# Explicit 1024 profile; no implicit 512 downgrade.
+& C:\dev\TRELLIS.2\.venv\Scripts\python.exe scripts\profile_1024_vram.py `
+  --image $warlordImage --vram-profile 8gb_1024 `
+  --decoder-chunk-size 32768 --max-num-tokens 49152 `
+  --baker zyrex --seed 42 --texture-size 2048 --decimation-target 500000 `
+  --output-dir outputs\vram1024-optimized
+
+$report = Get-Content outputs\vram1024-optimized\metrics.json -Raw | ConvertFrom-Json
+$report | Select-Object status, target_met, peak_vram_allocated_bytes, peak_vram_reserved_bytes
+$report.stage_metrics | Select-Object stage, status, time_s, `
+  @{Name='AllocatedGiB';Expression={ if ($null -ne $_.peak_vram_allocated_bytes) { $_.peak_vram_allocated_bytes / 1GB } }}, `
+  @{Name='ReservedGiB';Expression={ if ($null -ne $_.peak_vram_reserved_bytes) { $_.peak_vram_reserved_bytes / 1GB } }}
+```
+
+For the default baker, repeat **both** commands with `--baker nvdiffrast` and new
+output directories. Do not compare different bakers as a profile-only comparison.
+Repeat multiple times, inspect GLBs visually, check resolution and all failed
+stages, and attach reports before declaring the 8 GB/6.5 GiB goal achieved.
+The script defaults to the existing nvdiffrast baker; no baker source is changed.
+
+CPU-only regression commands (no model downloads/generation):
+
+```powershell
+$env:CUDA_VISIBLE_DEVICES = ''
+& C:\dev\TRELLIS.2\.venv\Scripts\python.exe -m pytest `
+  tests\test_memory_management.py tests\test_low_vram_mode.py tests\test_sparse_attention_sdpa.py -q
+Remove-Item Env:CUDA_VISIBLE_DEVICES -ErrorAction SilentlyContinue
+```
+
+The CPU suite uses real small tensors for sampler and projection equivalence, and
+mocks optional native dependencies, generation/extraction, and CUDA counters for
+control-flow/accounting tests. Mock counters are not measured VRAM. No dependencies
+or major dependency versions are added or changed by this profile.

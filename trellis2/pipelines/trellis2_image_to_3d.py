@@ -41,6 +41,14 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         'tex_slat_decoder',
     ]
     vram_profiles: Dict[str, Dict[str, Any]] = {
+        '8gb_1024': {
+            'force_low_vram': True,
+            'default_pipeline_type': '1024_cascade',
+            'max_num_tokens': 49152,
+            'empty_cache_between_stages': True,
+            'autocast_dtype': 'fp16',
+            'prefer_attention_backend': 'sdpa',
+        },
         '8gb': {
             'force_low_vram': True,
             'default_pipeline_type': '512',
@@ -143,6 +151,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
 
     def _resolve_vram_profile(self, requested: Optional[str]) -> Optional[str]:
         if requested is None:
+            requested = os.environ.get("ZYREX_VRAM_PROFILE")
+        if requested is None:
             if self._is_truthy(os.environ.get("ZYREX_LOW_VRAM")):
                 return '8gb'
             return None
@@ -240,6 +250,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             self.image_cond_model.to(device)
             if self.rembg_model is not None:
                 self.rembg_model.to(device)
+            self._models_offloaded_for_1024 = False
 
     def preprocess_image(self, input: Image.Image) -> Image.Image:
         """
@@ -386,72 +397,77 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             coords (torch.Tensor): The coordinates of the sparse structure.
             sampler_params (dict): Additional parameters for the sampler.
         """
-        # LR
-        noise = SparseTensor(
-            feats=torch.randn(coords.shape[0], flow_model_lr.in_channels).to(self.device),
-            coords=coords,
-        )
-        sampler_params = {**self.shape_slat_sampler_params, **sampler_params}
-        if self.low_vram:
-            flow_model_lr.to(self.device)
-        slat = self.shape_slat_sampler.sample(
-            flow_model_lr,
-            noise,
-            **lr_cond,
-            **sampler_params,
-            verbose=True,
-            tqdm_desc="Sampling shape SLat",
-        ).samples
-        if self.low_vram:
-            flow_model_lr.cpu()
-        std = torch.tensor(self.shape_slat_normalization['std'])[None].to(slat.device)
-        mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(slat.device)
-        slat = slat * std + mean
+        profiler = getattr(self, '_stage_profiler', None)
+        with profiler.stage('shape_slat_512') if profiler is not None else nullcontext():
+            # LR
+            noise = SparseTensor(
+                feats=torch.randn(coords.shape[0], flow_model_lr.in_channels).to(self.device),
+                coords=coords,
+            )
+            sampler_params = {**self.shape_slat_sampler_params, **sampler_params}
+            if self.low_vram:
+                flow_model_lr.to(self.device)
+            slat = self.shape_slat_sampler.sample(
+                flow_model_lr,
+                noise,
+                **lr_cond,
+                **sampler_params,
+                verbose=True,
+                tqdm_desc="Sampling shape SLat",
+            ).samples
+            if self.low_vram:
+                flow_model_lr.cpu()
+            std = torch.tensor(self.shape_slat_normalization['std'])[None].to(slat.device)
+            mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(slat.device)
+            slat = slat * std + mean
         
-        # Upsample
-        if self.low_vram:
-            self.models['shape_slat_decoder'].to(self.device)
-            self.models['shape_slat_decoder'].low_vram = True
-        hr_coords = self.models['shape_slat_decoder'].upsample(slat, upsample_times=4)
-        if self.low_vram:
-            self.models['shape_slat_decoder'].cpu()
-            self.models['shape_slat_decoder'].low_vram = False
-        hr_resolution = resolution
-        while True:
-            quant_coords = torch.cat([
-                hr_coords[:, :1],
-                ((hr_coords[:, 1:] + 0.5) / lr_resolution * (hr_resolution // 16)).int(),
-            ], dim=1)
-            coords = quant_coords.unique(dim=0)
-            num_tokens = coords.shape[0]
-            if num_tokens < max_num_tokens or hr_resolution == 1024:
-                if hr_resolution != resolution:
-                    print(f"Due to the limited number of tokens, the resolution is reduced to {hr_resolution}.")
-                break
-            hr_resolution -= 128
+        with profiler.stage('cascade_upsample') if profiler is not None else nullcontext():
+            # Upsample
+            if self.low_vram:
+                if getattr(self.models['shape_slat_decoder'], 'stream_device', None) is None:
+                    self.models['shape_slat_decoder'].to(self.device)
+                self.models['shape_slat_decoder'].low_vram = True
+            hr_coords = self.models['shape_slat_decoder'].upsample(slat, upsample_times=4)
+            if self.low_vram:
+                self.models['shape_slat_decoder'].cpu()
+                self.models['shape_slat_decoder'].low_vram = False
+            hr_resolution = resolution
+            while True:
+                quant_coords = torch.cat([
+                    hr_coords[:, :1],
+                    ((hr_coords[:, 1:] + 0.5) / lr_resolution * (hr_resolution // 16)).int(),
+                ], dim=1)
+                coords = quant_coords.unique(dim=0)
+                num_tokens = coords.shape[0]
+                if num_tokens < max_num_tokens or hr_resolution == 1024:
+                    if hr_resolution != resolution:
+                        print(f"Due to the limited number of tokens, the resolution is reduced to {hr_resolution}.")
+                    break
+                hr_resolution -= 128
         
-        # Sample structured latent
-        noise = SparseTensor(
-            feats=torch.randn(coords.shape[0], flow_model.in_channels).to(self.device),
-            coords=coords,
-        )
-        sampler_params = {**self.shape_slat_sampler_params, **sampler_params}
-        if self.low_vram:
-            flow_model.to(self.device)
-        slat = self.shape_slat_sampler.sample(
-            flow_model,
-            noise,
-            **cond,
-            **sampler_params,
-            verbose=True,
-            tqdm_desc="Sampling shape SLat",
-        ).samples
-        if self.low_vram:
-            flow_model.cpu()
+        with profiler.stage('shape_slat_1024') if profiler is not None else nullcontext():
+            # Sample structured latent
+            noise = SparseTensor(
+                feats=torch.randn(coords.shape[0], flow_model.in_channels).to(self.device),
+                coords=coords,
+            )
+            sampler_params = {**self.shape_slat_sampler_params, **sampler_params}
+            if self.low_vram:
+                flow_model.to(self.device)
+            slat = self.shape_slat_sampler.sample(
+                flow_model,
+                noise,
+                **cond,
+                **sampler_params,
+                verbose=True,
+                tqdm_desc="Sampling shape SLat",
+            ).samples
+            if self.low_vram:
+                flow_model.cpu()
 
-        std = torch.tensor(self.shape_slat_normalization['std'])[None].to(slat.device)
-        mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(slat.device)
-        slat = slat * std + mean
+            std = torch.tensor(self.shape_slat_normalization['std'])[None].to(slat.device)
+            mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(slat.device)
+            slat = slat * std + mean
         
         return slat, hr_resolution
 
@@ -472,7 +488,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         """
         self.models['shape_slat_decoder'].set_resolution(resolution)
         if self.low_vram:
-            self.models['shape_slat_decoder'].to(self.device)
+            if getattr(self.models['shape_slat_decoder'], 'stream_device', None) is None:
+                self.models['shape_slat_decoder'].to(self.device)
             self.models['shape_slat_decoder'].low_vram = True
         ret = self.models['shape_slat_decoder'](slat, return_subs=True)
         if self.low_vram:
@@ -538,7 +555,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             SparseTensor: The decoded texture voxels
         """
         if self.low_vram:
-            self.models['tex_slat_decoder'].to(self.device)
+            if getattr(self.models['tex_slat_decoder'], 'stream_device', None) is None:
+                self.models['tex_slat_decoder'].to(self.device)
         ret = self.models['tex_slat_decoder'](slat, guide_subs=subs) * 0.5 + 0.5
         if self.low_vram:
             self.models['tex_slat_decoder'].cpu()
@@ -592,6 +610,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         pipeline_type: Optional[str] = None,
         max_num_tokens: Optional[int] = None,
         vram_profile: Optional[str] = None,
+        profile_stages: bool = False,
+        decoder_chunk_size: Optional[int] = None,
     ) -> List[MeshWithVoxel]:
         """
         Run the pipeline.
@@ -608,10 +628,24 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             return_metrics (bool): Whether to return per-stage timing/VRAM metrics.
             pipeline_type (str): The type of the pipeline. Options: '512', '1024', '1024_cascade', '1536_cascade'.
             max_num_tokens (int): The maximum number of tokens to use.
-            vram_profile (str): Optional VRAM profile preset. Supported: '8gb'.
+            vram_profile (str): Optional VRAM profile preset. Supported: '8gb', '8gb_1024'.
+            profile_stages (bool): Detailed 1024 cascade profiling, including extraction.
+            decoder_chunk_size (int): Pointwise projection rows for 8gb_1024 (default 32768).
         """
         run_start_time = time.perf_counter()
         profile_name = self._resolve_vram_profile(vram_profile if vram_profile is not None else self.vram_profile)
+        if profile_name == '8gb_1024' or profile_stages:
+            from .low_vram_1024 import run_1024
+            return run_1024(
+                self, image, profile_name=profile_name, pipeline_type=pipeline_type,
+                num_samples=num_samples, seed=seed, preprocess_image=preprocess_image,
+                return_latent=return_latent, return_metrics=return_metrics,
+                max_num_tokens=max_num_tokens, decoder_chunk_size=decoder_chunk_size,
+                sparse_params=sparse_structure_sampler_params,
+                shape_params=shape_slat_sampler_params, tex_params=tex_slat_sampler_params,
+            )
+        if getattr(self, '_models_offloaded_for_1024', False) and not self.low_vram:
+            self.to(self.device)
         profile_cfg = self.vram_profiles.get(profile_name, {})
         if profile_cfg:
             self._configure_attention_backend_for_profile(profile_cfg)

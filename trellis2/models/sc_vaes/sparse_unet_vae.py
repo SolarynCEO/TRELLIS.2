@@ -1,3 +1,4 @@
+from ...utils.memory import resident_module, chunked_norm_linear
 from typing import *
 import torch
 import torch.nn as nn
@@ -475,11 +476,33 @@ class SparseUnetVaeDecoder(nn.Module):
                     nn.init.constant_(module.bias, 0)
         self.apply(_basic_init)
 
+    def _inference_call(self, module, *args, **kwargs):
+        device = getattr(self, 'stream_device', None)
+        if device is None:
+            return module(*args, **kwargs)
+        if self.training:
+            raise RuntimeError('Decoder streaming is inference-only')
+        with resident_module(module, device):
+            return module(*args, **kwargs)
+
+    def _project_output(self, h):
+        chunk_size = getattr(self, 'output_chunk_size', None)
+        if chunk_size is None:
+            h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))
+            return self._inference_call(self.output_layer, h)
+        if self.training or torch.is_grad_enabled():
+            raise RuntimeError('Chunked decoder projection is inference-only')
+        device = getattr(self, 'stream_device', None)
+        if device is None:
+            return h.replace(chunked_norm_linear(h.feats, self.output_layer, chunk_size))
+        with resident_module(self.output_layer, device):
+            return h.replace(chunked_norm_linear(h.feats, self.output_layer, chunk_size))
+
     def forward(self, x: sp.SparseTensor, guide_subs: Optional[List[sp.SparseTensor]] = None, return_subs: bool = False) -> sp.SparseTensor:
         assert guide_subs is None or self.pred_subdiv == False, "Only decoders with pred_subdiv=False can be used with guide_subs"
         assert return_subs == False or self.pred_subdiv == True, "Only decoders with pred_subdiv=True can be used with return_subs"
         
-        h = self.from_latent(x)
+        h = self._inference_call(self.from_latent, x)
         h = h.type(self.dtype)
         subs_gt = []
         subs = []
@@ -489,15 +512,14 @@ class SparseUnetVaeDecoder(nn.Module):
                     if self.pred_subdiv:
                         if self.training:
                             subs_gt.append(h.get_spatial_cache('subdivision'))
-                        h, sub = block(h)
+                        h, sub = self._inference_call(block, h)
                         subs.append(sub)
                     else:
-                        h = block(h, subdiv=guide_subs[i] if guide_subs is not None else None)
+                        h = self._inference_call(block, h, subdiv=guide_subs[i] if guide_subs is not None else None)
                 else:
-                    h = block(h)
+                    h = self._inference_call(block, h)
         h = h.type(x.dtype)
-        h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))
-        h = self.output_layer(h)
+        h = self._project_output(h)
         if self.training and self.pred_subdiv:
             return h, subs_gt, subs
         else:
@@ -509,14 +531,14 @@ class SparseUnetVaeDecoder(nn.Module):
     def upsample(self, x: sp.SparseTensor, upsample_times: int) -> torch.Tensor:
         assert self.pred_subdiv == True, "Only decoders with pred_subdiv=True can be used with upsampling"
         
-        h = self.from_latent(x)
+        h = self._inference_call(self.from_latent, x)
         h = h.type(self.dtype)
         for i, res in enumerate(self.blocks):
             if i == upsample_times:
                 return h.coords
             for j, block in enumerate(res):
                 if i < len(self.blocks) - 1 and j == len(res) - 1:
-                    h, sub = block(h)
+                    h, sub = self._inference_call(block, h)
                 else:
-                    h = block(h)
+                    h = self._inference_call(block, h)
        
