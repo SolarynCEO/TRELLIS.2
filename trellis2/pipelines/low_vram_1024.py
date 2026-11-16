@@ -39,7 +39,8 @@ def run_1024(pipeline, image, *, profile_name, pipeline_type, num_samples, seed,
                  decoder_chunk_size=decoder_chunk_size if optimized else None,
                  autocast_dtype=pipeline._dtype_name(dtype), status='failed',
                  stage_metrics=profiler.metrics, measurement_scope='pytorch_allocator',
-                 target_reserved_gib=6.5, target_met=None)
+                 target_reserved_gib=6.5, target_met=None,
+                 target_scope='pytorch_allocator_reserved_only')
     pipeline.last_run_stats = stats
     started = time.perf_counter()
     previous_low_vram = pipeline.low_vram
@@ -117,7 +118,9 @@ def run_1024(pipeline, image, *, profile_name, pipeline_type, num_samples, seed,
             if optimized:
                 del cond_512, coords
                 release_cache()
-            hr_coords = stage('cascade_upsample', lambda: upsample(low_shape), True)
+            # Sparse convolution requires matching feature/weight dtypes. Let the
+            # decoder use its checkpoint precision; flow autocast is not safe here.
+            hr_coords = stage('cascade_upsample', lambda: upsample(low_shape))
             if optimized:
                 del low_shape
                 release_cache()

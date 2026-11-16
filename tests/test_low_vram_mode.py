@@ -466,3 +466,60 @@ def test_streaming_decoder_block_failure_is_offloaded(pipeline_cls):
     with pytest.raises(RuntimeError, match='block failed'):
         decoder._inference_call(FailingBlock(), torch.ones(1))
     assert calls == ['cpu']
+
+
+def test_1024_upsample_uses_decoder_precision_without_flow_autocast(monkeypatch, pipeline_cls):
+    from trellis2.pipelines import low_vram_1024
+    from trellis2.modules.sparse import SparseTensor
+    from trellis2.models.sc_vaes.sparse_unet_vae import SparseUnetVaeDecoder
+    from trellis2.utils.memory import StageProfiler
+    pipeline, _ = _synthetic_1024(monkeypatch, pipeline_cls)
+    coords = torch.tensor([[0, 0, 0, 0]], dtype=torch.int32)
+    pipeline.sample_shape_slat = lambda *args: SparseTensor(feats=torch.ones(1, 2), coords=coords)
+    decoder = SparseUnetVaeDecoder(3, [4], 2, [0], ['unused'], [], [{}]).eval()
+    seen = []
+    class CheckDtype(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.eye(4))
+        def forward(self, value):
+            assert not torch.is_autocast_enabled('cpu')
+            assert value.feats.dtype == self.weight.dtype == decoder.dtype
+            seen.append(value.feats.dtype)
+            return value, None
+    decoder.blocks = nn.ModuleList([nn.ModuleList([CheckDtype()]), nn.ModuleList([])])
+    original_upsample = decoder.upsample
+    decoder.upsample = lambda x, upsample_times: original_upsample(x, upsample_times=1)
+    pipeline.models['shape_slat_decoder'] = decoder
+    # Exercise CUDA-autocast routing using real CPU autocast; no GPU calls.
+    monkeypatch.setattr(pipeline, '_is_cuda_runtime_active', lambda: True)
+    monkeypatch.setattr(low_vram_1024, 'StageProfiler', lambda *args, **kwargs: StageProfiler('cpu'))
+    monkeypatch.setattr(torch.cuda, 'empty_cache', lambda: None)
+    autocast = torch.autocast
+    monkeypatch.setattr(torch, 'autocast', lambda *args, **kwargs: autocast('cpu', dtype=torch.bfloat16))
+    pipeline.run(Image.new('RGB', (8, 8)), vram_profile='8gb_1024')
+    assert seen == [torch.float32]
+
+
+@pytest.mark.parametrize('chunk_size', [None, 2, 8])
+def test_texture_decode_preserves_pbr_channel_order(pipeline_cls, chunk_size):
+    from trellis2.modules.sparse import SparseTensor
+    from trellis2.models.sc_vaes.sparse_unet_vae import SparseUnetVaeDecoder
+    pipeline = _build_pipeline(pipeline_cls, low_vram=True)
+    decoder = SparseUnetVaeDecoder(6, [4], 2, [0], ['unused'], [], [{}], pred_subdiv=False).eval()
+    # Distinct RGB/M/R/A values after the decoder's [-1,1] -> [0,1] conversion.
+    expected = torch.tensor([0.1, 0.2, 0.3, 0.0, 0.7, 1.0])
+    with torch.no_grad():
+        decoder.output_layer.weight.zero_()
+        decoder.output_layer.bias.copy_(expected * 2 - 1)
+    if chunk_size is not None:
+        decoder.output_chunk_size = chunk_size
+        decoder.stream_device = 'cpu'
+    pipeline.models['tex_slat_decoder'] = decoder
+    slat = SparseTensor(feats=torch.randn(5, 2), coords=torch.tensor([[0, i, 0, 0] for i in range(5)], dtype=torch.int32))
+    with torch.no_grad():
+        decoded = pipeline.decode_tex_slat(slat, [])
+    layout = pipeline.pbr_attr_layout
+    for name, indices in {'base_color': (0, 3), 'metallic': (3, 4), 'roughness': (4, 5), 'alpha': (5, 6)}.items():
+        assert layout[name] == slice(*indices)
+        torch.testing.assert_close(decoded.feats[:, layout[name]], expected[layout[name]].expand(5, -1))

@@ -20,7 +20,39 @@ def parse_args(argv=None):
     parser.add_argument('--texture-size', type=int, default=2048)
     parser.add_argument('--decimation-target', type=int, default=500000)
     parser.add_argument('--baker', choices=['nvdiffrast', 'zyrex'], default='nvdiffrast')
+    parser.add_argument('--texture-diagnostics', action='store_true',
+                        help='Report decoded voxel channel statistics on CPU before baking.')
     return parser.parse_args(argv)
+
+
+def texture_channel_stats(mesh):
+    """Inspect pre-bake voxels, not UV pixels or surface-area-weighted samples.
+
+    Copy bounded chunks to CPU so diagnostics do not allocate large GPU masks.
+    Do not clamp or reorder predictions to hide material errors.
+    """
+    import torch
+    result = {}
+    for name, channel_slice in mesh.layout.items():
+        count = finite_count = near_one = 0
+        total = 0.0
+        low, high = float('inf'), float('-inf')
+        for start in range(0, mesh.attrs.shape[0], 65536):
+            values = mesh.attrs[start:start + 65536, channel_slice].detach().cpu().double()
+            count += values.numel()
+            values = values[torch.isfinite(values)]
+            finite_count += values.numel()
+            if values.numel():
+                total += values.sum().item()
+                low = min(low, values.min().item())
+                high = max(high, values.max().item())
+                near_one += int((values >= 0.99).sum().item())
+        result[name] = dict(channel_start=channel_slice.start, channel_stop=channel_slice.stop,
+                            value_count=count, finite_count=finite_count,
+                            min=low if finite_count else None, max=high if finite_count else None,
+                            mean=total / finite_count if finite_count else None,
+                            fraction_ge_0_99=near_one / finite_count if finite_count else None)
+    return result
 
 
 def main():
@@ -43,7 +75,8 @@ def main():
                   allocator_config_override=os.environ.get('PYTORCH_ALLOC_CONF'),
                   low_vram_dtype=os.environ.get('ZYREX_LOW_VRAM_DTYPE'),
                   measurement_scope='PyTorch allocator only; excludes direct native CUDA allocations',
-                  target_reserved_gib=6.5, target_met=None, run_metrics=None)
+                  target_reserved_gib=6.5, target_met=None, run_metrics=None,
+                  target_scope='pytorch_allocator_reserved_only')
     pipeline = None
     profiler = None
     try:
@@ -67,6 +100,9 @@ def main():
                 max_num_tokens=args.max_num_tokens, decoder_chunk_size=args.decoder_chunk_size)
         report['run_metrics'] = metrics
         mesh = outputs[0]
+        if args.texture_diagnostics:
+            with profiler.stage('texture_diagnostics'):
+                report['decoded_voxel_channels'] = texture_channel_stats(mesh)
         with profiler.stage('mesh_simplify'):
             mesh.simplify(16_777_216)
         with profiler.stage('bake'):

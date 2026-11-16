@@ -162,11 +162,28 @@ meshes, metrics = pipeline.run(image, vram_profile="8gb_1024", return_metrics=Tr
 assert metrics["output_resolution"] == 1024
 ```
 
-The goal is at most **6.5 GiB peak reserved**, leaving headroom on an 8 GB GPU.
-**This target is unverified. No GPU generation, bake, quality comparison, or
-per-stage VRAM measurements were run for this change.** The profile is a candidate
-for laptop validation, not a guarantee that all images fit. A token cap or OOM
-failure is not a successful 1024 result.
+The goal is at most **6.5 GiB PyTorch peak reserved**. In a user-reported
+RTX 4070 Laptop 8 GB run, disabling autocast for cascade upsampling allowed
+completion in **256.5 s**, with **5.27 GiB allocated / 5.93 GiB reserved**, highest
+at `texture_decode`. These are laptop measurements supplied by the user, not CPU
+test results or a GPU run performed by the agent.
+
+**nvidia-smi peaked at 7,886 MiB** (about 7.70 GiB) while PyTorch reserved peaked
+at 5.93 GiB. `target_met` tests only PyTorch allocator reserved memory and completed
+1024 generation; it does **not** certify total-device headroom or material quality.
+The report explicitly labels `target_scope=pytorch_allocator_reserved_only`.
+The differing scopes and sampling times cannot establish an exact allocation
+breakdown. This single run does not guarantee other images fit.
+
+The same output reportedly has metallic near 1.0 over 98% of the surface, versus
+0% for 512. **That material issue remains unresolved.** Source inspection and CPU
+sentinel tests confirm RGB / metallic / roughness / alpha at channels 0:3 / 3 / 4 /
+5, with no 1024-specific channel swap. The existing GLB packer places roughness
+in green and metallic in blue. Do not swap channels or force metallic to zero
+without evidence. Use `--texture-diagnostics` to capture pre-bake voxel statistics
+and compare against the GLB's blue metallic channel; voxel fractions are not
+surface-area-weighted measurements. Native GPU decoding and the actual assets
+still need comparison to identify the saturation source.
 
 The opt-in profile:
 
@@ -185,7 +202,8 @@ The opt-in profile:
   remain whole to preserve neighborhood/topology correctness.
 - Keeps decoder precision as configured in the checkpoint. Flow/conditioning
   autocast defaults to fp16, as in `8gb`; `ZYREX_LOW_VRAM_DTYPE=none|fp16|bf16`
-  controls it. Numerical/visual parity still needs real validation.
+  controls it. Cascade upsampling runs without flow autocast to avoid a flex_gemm
+  fp32/fp16 operand mismatch. Numerical/visual parity still needs real validation.
 - Rejects multiple samples, conflicting pipeline types, invalid chunk sizes, and
   a high-resolution token count above `max_num_tokens` (default 49152). It never
   silently lowers resolution or discards tokens. Raising this cap increases risk.
@@ -275,3 +293,21 @@ The CPU suite uses real small tensors for sampler and projection equivalence, an
 mocks optional native dependencies, generation/extraction, and CUDA counters for
 control-flow/accounting tests. Mock counters are not measured VRAM. No dependencies
 or major dependency versions are added or changed by this profile.
+
+
+### Opt-in real GPU smoke test
+
+The `gpu_smoke` pytest marker runs generation, baking and GLB export in an isolated
+process. It skips unless explicitly enabled and requires existing local weights;
+Hugging Face offline mode prevents downloads. It checks completion, not a universal
+VRAM/quality guarantee. It was **not run by the agent**.
+
+```powershell
+Remove-Item Env:CUDA_VISIBLE_DEVICES -ErrorAction SilentlyContinue
+$env:TRELLIS_RUN_GPU_SMOKE = '1'
+$env:TRELLIS_GPU_SMOKE_IMAGE = Read-Host 'Absolute path to local warlord image'
+$env:TRELLIS_GPU_SMOKE_MODEL = Read-Host 'Local TRELLIS.2 weights directory containing pipeline.json'
+$env:TRELLIS_GPU_SMOKE_BAKER = 'zyrex'
+& C:\dev\TRELLIS.2\.venv\Scripts\python.exe -m pytest tests\test_low_vram_gpu_smoke.py -m gpu_smoke -v
+Remove-Item Env:TRELLIS_RUN_GPU_SMOKE -ErrorAction SilentlyContinue
+```

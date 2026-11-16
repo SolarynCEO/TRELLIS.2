@@ -108,3 +108,19 @@ def test_profile_script_cpu_failure_writes_null_metrics(monkeypatch, tmp_path):
     assert report['target_met'] is None
     assert report['stage_metrics'] == []
     assert report['peak_vram_reserved_bytes'] is None
+
+
+def test_texture_diagnostics_distinguishes_metallic_from_alpha():
+    import importlib.util
+    from pathlib import Path
+    from types import SimpleNamespace
+    script = Path(__file__).resolve().parents[1] / 'scripts' / 'profile_1024_vram.py'
+    spec = importlib.util.spec_from_file_location('profile_diagnostics', script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    mesh = SimpleNamespace(attrs=torch.tensor([[0.1, 0.2, 0.3, 0.0, 0.7, 1.0]]),
+                           layout={'metallic': slice(3, 4), 'alpha': slice(5, 6)})
+    stats = module.texture_channel_stats(mesh)
+    assert stats['metallic']['mean'] == 0.0
+    assert stats['metallic']['fraction_ge_0_99'] == 0.0
+    assert stats['alpha']['fraction_ge_0_99'] == 1.0
