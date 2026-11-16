@@ -4,6 +4,53 @@ from io import BytesIO
 import json
 from pathlib import Path
 import struct
+import hashlib
+
+
+def tensor_fingerprint(value):
+    """Exact bytes/dtype/shape fingerprint; supports bfloat16 without numpy casts."""
+    import torch
+    value = getattr(value, 'feats', value)
+    digest = hashlib.sha256(str((str(value.dtype), list(value.shape))).encode())
+    rows = value.reshape(-1, value.shape[-1])
+    for start in range(0, rows.shape[0], 16384):
+        chunk = rows[start:start + 16384].detach().cpu().contiguous()
+        digest.update(chunk.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
+def model_precision(model):
+    input_layer = getattr(model, 'from_latent', getattr(model, 'input_layer', None))
+    output_layer = getattr(model, 'output_layer', getattr(model, 'out_layer', None))
+    return dict(configured_dtype=str(getattr(model, 'dtype', None)),
+                parameter_dtypes=sorted({str(p.dtype) for p in model.parameters()}),
+                input_projection_dtype=str(input_layer.weight.dtype) if hasattr(input_layer, 'weight') else None,
+                output_projection_dtype=str(output_layer.weight.dtype) if hasattr(output_layer, 'weight') else None)
+
+
+@contextmanager
+def checkpoint_texture_flow_precision(pipeline):
+    """Diagnostic only: disable outer autocast for the texture sampler.
+
+    The flow's existing manual_cast then selects its configured checkpoint dtype;
+    other conditioning/shape stages and all model parameters remain unchanged.
+    """
+    import torch
+    sampler = pipeline.tex_slat_sampler
+    original = sampler.sample
+    had_override = 'sample' in vars(sampler)
+    old_override = vars(sampler).get('sample')
+    def sample(*args, **kwargs):
+        with torch.autocast(device_type=torch.device(pipeline.device).type, enabled=False):
+            return original(*args, **kwargs)
+    try:
+        sampler.sample = sample
+        yield
+    finally:
+        if had_override:
+            sampler.sample = old_override
+        else:
+            del sampler.sample
 
 
 def tensor_stats(value, *, scale=1.0, offset=0.0):
@@ -51,20 +98,38 @@ def trace_texture(pipeline, report):
     report['checkpoint_models'] = getattr(pipeline, '_pretrained_args', {}).get('models', {})
 
     def sample(model, noise, **kwargs):
+        import torch
         report['flow_model'] = next((name for name, m in pipeline.models.items() if m is model), 'unknown')
+        report['flow_precision'] = model_precision(model)
         report['noise'] = tensor_stats(noise)
         for key in ('cond', 'neg_cond', 'concat_cond'):
             if key in kwargs:
                 report[key] = tensor_stats(kwargs[key])
         report['sampler_params'] = {k: v for k, v in kwargs.items()
                                     if isinstance(v, (str, int, float, bool, type(None), list, tuple))}
-        result = original(model, noise, **kwargs)
+        def flow_before(module, args):
+            if 'flow_forward_precision' not in report:
+                device_type = args[0].device.type
+                report['flow_forward_precision'] = dict(
+                    input_dtype=str(args[0].dtype),
+                    autocast_enabled=torch.is_autocast_enabled(device_type),
+                    autocast_dtype=str(torch.get_autocast_dtype(device_type)))
+        handle = model.register_forward_pre_hook(flow_before)
+        try:
+            result = original(model, noise, **kwargs)
+        finally:
+            handle.remove()
         report['predicted_normalized_tex_slat'] = tensor_stats(result.samples)
+        report['predicted_normalized_tex_slat_sha256'] = tensor_fingerprint(result.samples)
         return result
 
     def before(module, args):
         report['decoder_input_denormalized_tex_slat'] = tensor_stats(args[0])
         report['decoder_dtype'] = str(module.dtype)
+        report['decoder_precision'] = model_precision(module)
+        report['decoder_input_sha256'] = tensor_fingerprint(args[0])
+        if hasattr(args[0], 'coords'):
+            report['decoder_input_coords_sha256'] = tensor_fingerprint(args[0].coords)
         report['decoder_output_chunk_size'] = getattr(module, 'output_chunk_size', None)
 
     def after(module, args, output):
@@ -142,3 +207,34 @@ def assert_warlord_metallic(report):
     ratio = report['baked_metallic']['metallic_high_ratio']
     if not 0 <= ratio <= 0.5:
         raise AssertionError(f'Warlord metallic_high_ratio={ratio!r} exceeds 0.5; inspect texture_trace in metrics.json')
+
+
+def compare_texture_reports(reports):
+    """Compare supplied reports without claiming to have run their GPU workloads."""
+    baseline = reports.get('baseline_1024', {}).get('texture_trace', {})
+    result = {}
+    for label, report in reports.items():
+        trace = report['texture_trace']
+        raw_metal = trace['raw_decoder_output']['channels'][3]
+        keys = ('decoder_input_sha256', 'decoder_input_coords_sha256')
+        match = (all(trace[key] == baseline[key] for key in keys)
+                 if all(trace.get(key) and baseline.get(key) for key in keys) else None)
+        result[label] = dict(raw_decoder_metallic=raw_metal,
+                             flow_model=trace['flow_model'], flow_precision=trace.get('flow_precision'),
+                             flow_forward_precision=trace.get('flow_forward_precision'),
+                             decoder_precision=trace.get('decoder_precision'),
+                             same_decoder_input_as_baseline_1024=match,
+                             baked_metallic_high_ratio=report['baked_metallic']['metallic_high_ratio'])
+    return result
+
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser(description='Compare texture-trace reports; no GPU work.')
+    parser.add_argument('--report', action='append', required=True, help='LABEL=metrics.json; use baseline_1024 for the reference')
+    args = parser.parse_args()
+    reports = {}
+    for entry in args.report:
+        label, path = entry.split('=', 1)
+        reports[label] = json.loads(Path(path).read_text(encoding='utf-8'))
+    print(json.dumps(compare_texture_reports(reports), indent=2))

@@ -25,6 +25,10 @@ def parse_args(argv=None):
                         help='Report decoded voxel channel statistics on CPU before baking.')
     parser.add_argument('--texture-trace', action='store_true',
                         help='Trace texture conditioning, sampled latents, normalization and raw decoder output; affects timing.')
+    parser.add_argument('--texture-decoder-dtype', choices=['checkpoint', 'fp32'], default='checkpoint',
+                        help='Diagnostic arithmetic-only decoder precision override; fp32 may exceed 8 GB.')
+    parser.add_argument('--texture-flow-autocast', choices=['profile', 'checkpoint'], default='profile',
+                        help='Diagnostic: checkpoint disables extra autocast only during texture sampling.')
     return parser.parse_args(argv)
 
 
@@ -94,14 +98,22 @@ def main():
                               cuda_version=torch.version.cuda, torch_version=torch.__version__)
         with profiler.stage('load_models'):
             pipeline = Trellis2ImageTo3DPipeline.from_pretrained(args.model_id)
+            if args.texture_decoder_dtype == 'fp32':
+                # Arithmetic-only ablation of the loaded weights, not a replacement
+                # checkpoint or recovery of precision lost during initial loading.
+                pipeline.models['tex_slat_decoder'].convert_to_fp32()
             pipeline.low_vram = args.vram_profile in ('8gb', '8gb_1024') or args.low_vram == 'on'
             pipeline.to(torch.device('cuda'))
         trace_context = nullcontext()
+        flow_context = nullcontext()
+        if args.texture_flow_autocast == 'checkpoint':
+            from scripts.texture_diagnostics import checkpoint_texture_flow_precision
+            flow_context = checkpoint_texture_flow_precision(pipeline)
         if args.texture_trace:
             from scripts.texture_diagnostics import trace_texture
             report['texture_trace'] = {}
             trace_context = trace_texture(pipeline, report['texture_trace'])
-        with Image.open(args.image) as image, trace_context:
+        with Image.open(args.image) as image, flow_context, trace_context:
             outputs, metrics = pipeline.run(
                 image, seed=args.seed, pipeline_type='512' if args.vram_profile == '8gb' else '1024_cascade',
                 vram_profile=args.vram_profile, profile_stages=args.vram_profile != '8gb', return_metrics=True,

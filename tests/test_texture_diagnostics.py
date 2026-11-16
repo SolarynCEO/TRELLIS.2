@@ -58,3 +58,50 @@ def test_channel_moments_and_scaling_are_cpu_only():
     assert scaled['channels'][0]['std'] == 0.5
     assert scaled['channels'][1]['finite_count'] == 1
     assert scaled['channels'][1]['mean'] == 2.5
+
+
+def test_fingerprints_detect_changed_latents_and_support_bf16():
+    from scripts.texture_diagnostics import tensor_fingerprint
+    values = torch.ones(2, 32, dtype=torch.bfloat16)
+    expected = tensor_fingerprint(values)
+    assert tensor_fingerprint(values.clone()) == expected
+    assert tensor_fingerprint(values.float()) != expected
+    values[1, 3] = 2
+    assert tensor_fingerprint(values) != expected
+
+
+def test_checkpoint_flow_precision_disables_only_its_scoped_autocast():
+    from types import SimpleNamespace
+    from scripts.texture_diagnostics import checkpoint_texture_flow_precision
+    class Sampler:
+        def sample(self):
+            return torch.is_autocast_enabled('cpu')
+    sampler = Sampler()
+    pipeline = SimpleNamespace(device='cpu', tex_slat_sampler=sampler)
+    with torch.autocast('cpu', dtype=torch.bfloat16):
+        assert sampler.sample()
+        with checkpoint_texture_flow_precision(pipeline):
+            assert not sampler.sample()
+            assert torch.is_autocast_enabled('cpu')
+        assert sampler.sample()
+        with pytest.raises(ValueError):
+            with checkpoint_texture_flow_precision(pipeline):
+                raise ValueError('failure')
+        assert sampler.sample()
+    assert 'sample' not in vars(sampler)
+
+
+def test_comparison_requires_matching_latent_and_coordinate_fingerprints():
+    import copy
+    from scripts.texture_diagnostics import compare_texture_reports
+    report = {'texture_trace': {
+        'flow_model': 'tex_slat_flow_model_1024',
+        'raw_decoder_output': {'channels': [{}]*3 + [{'mean': 0.999, 'std': 0.0018}]},
+        'decoder_input_sha256': 'latent', 'decoder_input_coords_sha256': 'coords'},
+        'baked_metallic': {'metallic_high_ratio': 0.9813}}
+    changed = copy.deepcopy(report)
+    changed['texture_trace']['decoder_input_coords_sha256'] = 'different'
+    summary = compare_texture_reports({'baseline_1024': report, 'decoder_fp32': copy.deepcopy(report), 'changed': changed})
+    assert summary['decoder_fp32']['same_decoder_input_as_baseline_1024'] is True
+    assert summary['changed']['same_decoder_input_as_baseline_1024'] is False
+    assert summary['baseline_1024']['raw_decoder_metallic']['mean'] == 0.999

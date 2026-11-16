@@ -345,3 +345,65 @@ $env:TRELLIS_GPU_SMOKE_BAKER = 'zyrex'
 & C:\dev\TRELLIS.2\.venv\Scripts\python.exe -m pytest tests\test_low_vram_gpu_smoke.py -m gpu_regression -v
 Remove-Item Env:TRELLIS_RUN_WARLORD_REGRESSION -ErrorAction SilentlyContinue
 ```
+
+### Isolating texture flow precision from decoder precision
+
+The latest user run reports baked metallic_high_ratio **0.9813** and raw decoder
+channel 3 min **0.969**, mean **0.999**, std **0.0018**; the 32-channel texture
+latent is not collapsed and roughness varies. This is before output scaling.
+The saturation is still unresolved; the 0.5 warlord gate is unchanged.
+
+Inspection of cached Microsoft model config revision
+`af44b45f2e35a493886929c6d786e563ec68364d` shows separate 512/1024 texture flow
+checkpoints configured for **bf16**, but one shared `tex_dec_next_dc_f16c32_fp16`
+decoder (`SparseUnetVaeDecoder`, 32 input channels, 6 output channels, fp16 blocks).
+The decoder input/output projections remain fp32. This cached config is evidence
+about the model design, not proof of the exact config used by a particular run.
+The trace records the actual model paths and live dtypes.
+
+Flow `manual_cast` uses the configured bf16 dtype only when autocast is disabled;
+the profile normally requests fp16 autocast. This is a precision hypothesis, not
+evidence that fp16 causes the saturation. A concrete conversion bug was found:
+decoder `convert_to_fp32()` changed block weights but did not update `self.dtype`,
+so forward still cast features to fp16. Conversion methods now keep activation
+dtype and `use_fp16` synchronized with the block weights. Constructor defaults
+and the normal generation path are unchanged.
+
+Two benchmark-only switches isolate these questions:
+
+- `--texture-decoder-dtype fp32`: changes only the loaded texture decoder's block
+  arithmetic. It does not recover precision already lost when loading into fp16
+  parameters or change checkpoint files. **May exceed 8 GB**; it is not a new
+  production memory profile or a validated fix.
+- `--texture-flow-autocast checkpoint`: disables extra autocast only inside the
+  texture sampler so the existing flow uses its configured dtype (bf16 in the
+  inspected configs). Shape/conditioning stages and model parameters are unchanged.
+
+Run separate processes with the same input/seed/baker. These diagnostic switches
+are off by default. Trace overhead makes these quality comparisons unsuitable as
+performance measurements. Example from the engine repository root:
+
+```powershell
+$image = Read-Host 'Absolute path to local warlord fixture'
+$model = Read-Host 'Local weights directory containing pipeline.json'
+$env:HF_HUB_OFFLINE = '1'
+$env:TRANSFORMERS_OFFLINE = '1'
+$env:ZYREX_LOW_VRAM_DTYPE = 'fp16'
+Remove-Item Env:CUDA_VISIBLE_DEVICES -ErrorAction SilentlyContinue
+& C:\dev\TRELLIS.2\.venv\Scripts\python.exe scripts\profile_1024_vram.py --image $image --model-id $model --seed 42 --baker zyrex --texture-trace --vram-profile 8gb --output-dir outputs\texture-ablation\baseline_512
+& C:\dev\TRELLIS.2\.venv\Scripts\python.exe scripts\profile_1024_vram.py --image $image --model-id $model --seed 42 --baker zyrex --texture-trace --vram-profile 8gb_1024 --output-dir outputs\texture-ablation\baseline_1024
+& C:\dev\TRELLIS.2\.venv\Scripts\python.exe scripts\profile_1024_vram.py --image $image --model-id $model --seed 42 --baker zyrex --texture-trace --vram-profile 8gb_1024 --texture-decoder-dtype fp32 --output-dir outputs\texture-ablation\decoder_fp32
+& C:\dev\TRELLIS.2\.venv\Scripts\python.exe scripts\profile_1024_vram.py --image $image --model-id $model --seed 42 --baker zyrex --texture-trace --vram-profile 8gb_1024 --texture-flow-autocast checkpoint --output-dir outputs\texture-ablation\checkpoint_flow
+& C:\dev\TRELLIS.2\.venv\Scripts\python.exe scripts\texture_diagnostics.py `
+  --report baseline_512=outputs\texture-ablation\baseline_512\metrics.json `
+  --report baseline_1024=outputs\texture-ablation\baseline_1024\metrics.json `
+  --report decoder_fp32=outputs\texture-ablation\decoder_fp32\metrics.json `
+  --report checkpoint_flow=outputs\texture-ablation\checkpoint_flow\metrics.json
+```
+
+The comparison prints raw metallic min/mean/std, baked ratios, flow/decoder
+precision and whether decoder input bytes **and coordinates** match the 1024
+baseline. Only attribute a decoder-only difference to precision if those inputs
+match. A 512 input is not expected to match 1024. OOM/failed runs are not passing
+quality results. No GPU ablations were run by the agent; no metallic correction
+has been validated. The existing `gpu_regression` test remains the acceptance gate.

@@ -565,3 +565,32 @@ def test_texture_trace_captures_conditioning_and_single_normalization(pipeline_c
             raise RuntimeError('synthetic failure')
     assert 'sample' not in vars(sampler)
     assert not pipeline.models['tex_slat_decoder']._forward_pre_hooks
+
+
+def test_decoder_precision_conversion_updates_features_and_weights(pipeline_cls):
+    from trellis2.models.sc_vaes.sparse_unet_vae import SparseUnetVaeDecoder
+    from trellis2.modules.sparse import SparseTensor
+    decoder = SparseUnetVaeDecoder(6, [4], 2, [0], ['unused'], [], [{}], pred_subdiv=False).eval()
+    seen = []
+    class Pointwise(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(4, 4)
+        def forward(self, value):
+            assert value.feats.dtype == self.linear.weight.dtype == decoder.dtype
+            seen.append(value.feats.dtype)
+            return value.replace(self.linear(value.feats))
+    decoder.blocks[0].append(Pointwise())
+    slat = SparseTensor(feats=torch.ones(2, 2), coords=torch.tensor([[0, 0, 0, 0], [0, 1, 0, 0]], dtype=torch.int32))
+    with torch.no_grad():
+        decoder.convert_to_fp16()
+        assert decoder.use_fp16 and decoder.dtype == torch.float16
+        decoder(slat)
+        decoder.convert_to_fp32()
+        assert not decoder.use_fp16 and decoder.dtype == torch.float32
+        decoder(slat)
+        decoder.convert_to_fp16()
+        decoder(slat)
+    assert seen == [torch.float16, torch.float32, torch.float16]
+    # Checkpoint input/output projections stay FP32 in the mixed-precision design.
+    assert decoder.from_latent.weight.dtype == decoder.output_layer.weight.dtype == torch.float32

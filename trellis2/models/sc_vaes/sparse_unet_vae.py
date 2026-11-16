@@ -460,12 +460,16 @@ class SparseUnetVaeDecoder(nn.Module):
         Convert the torso of the model to float16.
         """
         self.blocks.apply(convert_module_to_f16)
+        self.dtype = torch.float16
+        self.use_fp16 = True
 
     def convert_to_fp32(self) -> None:
         """
         Convert the torso of the model to float32.
         """
         self.blocks.apply(convert_module_to_f32)
+        self.dtype = torch.float32
+        self.use_fp16 = False
 
     def initialize_weights(self) -> None:
         # Initialize transformer layers:
