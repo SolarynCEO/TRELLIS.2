@@ -164,8 +164,8 @@ assert metrics["output_resolution"] == 1024
 
 The goal is at most **6.5 GiB PyTorch peak reserved**. In a user-reported
 RTX 4070 Laptop 8 GB run, disabling autocast for cascade upsampling allowed
-completion in **256.5 s**, with **5.27 GiB allocated / 5.93 GiB reserved**, highest
-at `texture_decode`. These are laptop measurements supplied by the user, not CPU
+completion in **256.5 s**, with **5.27 GiB allocated (peak at `bake`) / 5.93 GiB reserved
+(peak at `texture_decode`)**. These are laptop measurements supplied by the user, not CPU
 test results or a GPU run performed by the agent.
 
 **nvidia-smi peaked at 7,886 MiB** (about 7.70 GiB) while PyTorch reserved peaked
@@ -175,15 +175,27 @@ The report explicitly labels `target_scope=pytorch_allocator_reserved_only`.
 The differing scopes and sampling times cannot establish an exact allocation
 breakdown. This single run does not guarantee other images fit.
 
-The same output reportedly has metallic near 1.0 over 98% of the surface, versus
-0% for 512. **That material issue remains unresolved.** Source inspection and CPU
-sentinel tests confirm RGB / metallic / roughness / alpha at channels 0:3 / 3 / 4 /
-5, with no 1024-specific channel swap. The existing GLB packer places roughness
-in green and metallic in blue. Do not swap channels or force metallic to zero
-without evidence. Use `--texture-diagnostics` to capture pre-bake voxel statistics
-and compare against the GLB's blue metallic channel; voxel fractions are not
-surface-area-weighted measurements. Native GPU decoding and the actual assets
-still need comparison to identify the saturation source.
+The user confirmed that metallic saturation starts in decoded voxels, before
+bake: warlord seed 42, channel 3 min 0.985, mean 0.9996, fraction >= 0.99
+0.99999; roughness varied with mean 0.82 and base color looked normal. The baked
+blue-channel ratio >= 0.95 was 0.9805. **The material issue remains unresolved.**
+It is not a GLB packing issue or a reason to swap channels or zero metallic.
+
+Source audit: both profiles use the same normalization functions. Shape SLat
+conditioning is normalized once; texture predictions are denormalized once;
+the decoder uses `raw * 0.5 + 0.5`, consistent with the PBR training render path.
+CPU tests cover nontrivial mean/scale values and both texture flow selections.
+Actual 512/1024 GPU latent predictions have not been compared by the agent.
+
+`--texture-trace` now records actual texture conditioning, normalized shape
+conditioning, normalized sampler predictions, denormalized decoder inputs,
+raw/scaled decoder channel moments, model identifiers, normalization vectors,
+decoded voxel statistics and the exported GLB blue-channel ratio. Statistics are
+copied to CPU in bounded chunks; model outputs are never edited. Trace runs add
+CPU transfers and are **not timing benchmarks**. Use `--vram-profile 8gb` for the
+512 reference and `--vram-profile 8gb_1024` for the cascade with the same seed.
+Matching seeds do not align individual noise/latent elements across different
+token counts and coordinate layouts.
 
 The opt-in profile:
 
@@ -310,4 +322,26 @@ $env:TRELLIS_GPU_SMOKE_MODEL = Read-Host 'Local TRELLIS.2 weights directory cont
 $env:TRELLIS_GPU_SMOKE_BAKER = 'zyrex'
 & C:\dev\TRELLIS.2\.venv\Scripts\python.exe -m pytest tests\test_low_vram_gpu_smoke.py -m gpu_smoke -v
 Remove-Item Env:TRELLIS_RUN_GPU_SMOKE -ErrorAction SilentlyContinue
+```
+
+
+### Warlord metallic regression (GPU, opt-in)
+
+This test runs **both** 512 and 1024 with seed 42 in independent offline processes,
+saves both GLBs/reports and `comparison.json` under the pytest temp directory, then
+fails if either `baked_metallic.metallic_high_ratio` exceeds **0.5**. The ratio
+uses blue >= 0.95 over encoded metallic-roughness texture pixels (including UV
+padding), with the maximum ratio across materials; it is not surface-area-weighted.
+Material factors cannot hide saturation. The user-reported 0.9805 fails this gate.
+No GPU regression was run by the agent. It is expected to expose the unresolved
+bug until a supported fix is validated. No fixture or weights are committed.
+
+```powershell
+Remove-Item Env:CUDA_VISIBLE_DEVICES -ErrorAction SilentlyContinue
+$env:TRELLIS_RUN_WARLORD_REGRESSION = '1'
+$env:TRELLIS_WARLORD_IMAGE = Read-Host 'Absolute path to local warlord fixture'
+$env:TRELLIS_GPU_SMOKE_MODEL = Read-Host 'Local weights directory containing pipeline.json'
+$env:TRELLIS_GPU_SMOKE_BAKER = 'zyrex'
+& C:\dev\TRELLIS.2\.venv\Scripts\python.exe -m pytest tests\test_low_vram_gpu_smoke.py -m gpu_regression -v
+Remove-Item Env:TRELLIS_RUN_WARLORD_REGRESSION -ErrorAction SilentlyContinue
 ```

@@ -523,3 +523,45 @@ def test_texture_decode_preserves_pbr_channel_order(pipeline_cls, chunk_size):
     for name, indices in {'base_color': (0, 3), 'metallic': (3, 4), 'roughness': (4, 5), 'alpha': (5, 6)}.items():
         assert layout[name] == slice(*indices)
         torch.testing.assert_close(decoded.feats[:, layout[name]], expected[layout[name]].expand(5, -1))
+
+
+@pytest.mark.parametrize('resolution', [512, 1024])
+def test_texture_trace_captures_conditioning_and_single_normalization(pipeline_cls, resolution):
+    from scripts.texture_diagnostics import trace_texture
+    from trellis2.modules.sparse import SparseTensor
+    pipeline = _build_pipeline(pipeline_cls, low_vram=True)
+    pipeline.shape_slat_normalization = {'mean': [1., 3.], 'std': [2., 4.]}
+    pipeline.tex_slat_normalization = {'mean': [-2., 4.], 'std': [3., 5.]}
+    flow = pipeline.models[f'tex_slat_flow_model_{resolution}']
+    flow.in_channels = 4
+    shape = SparseTensor(feats=torch.tensor([[5., 15.]]), coords=torch.zeros(1, 4, dtype=torch.int32))
+    class Sampler:
+        def sample(self, model, noise, **kwargs):
+            torch.testing.assert_close(kwargs['concat_cond'].feats, torch.tensor([[2., 3.]]))
+            assert kwargs['cond'].item() == resolution
+            return types.SimpleNamespace(samples=noise.replace(torch.tensor([[2., -1.]])))
+    sampler = Sampler()
+    pipeline.tex_slat_sampler = sampler
+    class Decoder(nn.Module):
+        dtype = torch.float32
+        def forward(self, slat, **kwargs):
+            torch.testing.assert_close(slat.feats, torch.tensor([[4., -1.]]))
+            return slat.replace(torch.tensor([[-1., 0., 1., -0.8, 0.6, 1.]]))
+    pipeline.models['tex_slat_decoder'] = Decoder()
+    report = {}
+    with trace_texture(pipeline, report):
+        latent = pipeline.sample_tex_slat({'cond': torch.tensor([[float(resolution)]])}, flow, shape)
+        decoded = pipeline.decode_tex_slat(latent, [])
+    torch.testing.assert_close(decoded.feats, torch.tensor([[0., 0.5, 1., 0.1, 0.8, 1.]]))
+    assert report['flow_model'] == f'tex_slat_flow_model_{resolution}'
+    assert report['predicted_normalized_tex_slat']['channels'][0]['mean'] == 2
+    assert report['decoder_input_denormalized_tex_slat']['channels'][0]['mean'] == 4
+    assert report['raw_decoder_output']['channels'][3]['mean'] == pytest.approx(-0.8)
+    assert report['scaled_decoder_output']['channels'][3]['mean'] == pytest.approx(0.1)
+    assert 'sample' not in vars(sampler)
+    assert not pipeline.models['tex_slat_decoder']._forward_hooks
+    with pytest.raises(RuntimeError):
+        with trace_texture(pipeline, {}):
+            raise RuntimeError('synthetic failure')
+    assert 'sample' not in vars(sampler)
+    assert not pipeline.models['tex_slat_decoder']._forward_pre_hooks

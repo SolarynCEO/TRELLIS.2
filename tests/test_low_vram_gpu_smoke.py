@@ -35,3 +35,35 @@ def test_8gb_1024_end_to_end(tmp_path):
         assert stages[stage] == 'ok'
     # Completion is distinct from the allocator budget and physical-device usage.
     assert report['target_scope'] == 'pytorch_allocator_reserved_only'
+
+
+@pytest.mark.gpu_regression
+def test_warlord_seed42_metallic_512_vs_1024(tmp_path):
+    if os.environ.get('TRELLIS_RUN_WARLORD_REGRESSION') != '1':
+        pytest.skip('Set TRELLIS_RUN_WARLORD_REGRESSION=1 with local warlord image and weights')
+    from scripts.texture_diagnostics import assert_warlord_metallic
+    image = Path(os.environ['TRELLIS_WARLORD_IMAGE']).resolve()
+    model = Path(os.environ['TRELLIS_GPU_SMOKE_MODEL']).resolve()
+    assert image.is_file()
+    assert (model / 'pipeline.json').is_file()
+    root = Path(__file__).resolve().parents[1]
+    env = dict(os.environ, HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1', ZYREX_LOW_VRAM_DTYPE='fp16')
+    reports = {}
+    # Same seed/settings in independent processes; different sparse layouts mean
+    # random tensors need not match elementwise. Do not compare unmatched voxels.
+    for profile in ('8gb', '8gb_1024'):
+        output = tmp_path / profile
+        subprocess.run([
+            sys.executable, str(root / 'scripts/profile_1024_vram.py'),
+            '--image', str(image), '--model-id', str(model), '--seed', '42',
+            '--output-dir', str(output), '--vram-profile', profile, '--texture-trace',
+            '--baker', os.environ.get('TRELLIS_GPU_SMOKE_BAKER', 'zyrex'),
+        ], cwd=root, env=env, check=True)
+        reports[profile] = json.loads((output / 'metrics.json').read_text(encoding='utf-8'))
+        assert reports[profile]['status'] == 'ok'
+    (tmp_path / 'comparison.json').write_text(json.dumps(reports, indent=2), encoding='utf-8')
+    assert reports['8gb']['run_metrics']['pipeline_type'] == '512'
+    assert reports['8gb_1024']['run_metrics']['output_resolution'] == 1024
+    # Both runs complete and retain reports before the quality gate fails.
+    for report in reports.values():
+        assert_warlord_metallic(report)

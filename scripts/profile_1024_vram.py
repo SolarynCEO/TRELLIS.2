@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import sys
+from contextlib import nullcontext
 
 
 def parse_args(argv=None):
@@ -11,17 +12,19 @@ def parse_args(argv=None):
     parser.add_argument('--image', required=True)
     parser.add_argument('--model-id', default='microsoft/TRELLIS.2-4B')
     parser.add_argument('--output-dir', required=True)
-    parser.add_argument('--vram-profile', choices=['none', '8gb_1024'], default='8gb_1024')
+    parser.add_argument('--vram-profile', choices=['none', '8gb', '8gb_1024'], default='8gb_1024')
     parser.add_argument('--low-vram', choices=['on', 'off'], default='on',
                         help='Legacy model offload for the none baseline; 8gb_1024 always enables it.')
     parser.add_argument('--decoder-chunk-size', type=int, default=32768)
-    parser.add_argument('--max-num-tokens', type=int, default=49152)
+    parser.add_argument('--max-num-tokens', type=int, default=None)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--texture-size', type=int, default=2048)
     parser.add_argument('--decimation-target', type=int, default=500000)
     parser.add_argument('--baker', choices=['nvdiffrast', 'zyrex'], default='nvdiffrast')
     parser.add_argument('--texture-diagnostics', action='store_true',
                         help='Report decoded voxel channel statistics on CPU before baking.')
+    parser.add_argument('--texture-trace', action='store_true',
+                        help='Trace texture conditioning, sampled latents, normalization and raw decoder output; affects timing.')
     return parser.parse_args(argv)
 
 
@@ -91,16 +94,21 @@ def main():
                               cuda_version=torch.version.cuda, torch_version=torch.__version__)
         with profiler.stage('load_models'):
             pipeline = Trellis2ImageTo3DPipeline.from_pretrained(args.model_id)
-            pipeline.low_vram = args.vram_profile == '8gb_1024' or args.low_vram == 'on'
+            pipeline.low_vram = args.vram_profile in ('8gb', '8gb_1024') or args.low_vram == 'on'
             pipeline.to(torch.device('cuda'))
-        with Image.open(args.image) as image:
+        trace_context = nullcontext()
+        if args.texture_trace:
+            from scripts.texture_diagnostics import trace_texture
+            report['texture_trace'] = {}
+            trace_context = trace_texture(pipeline, report['texture_trace'])
+        with Image.open(args.image) as image, trace_context:
             outputs, metrics = pipeline.run(
-                image, seed=args.seed, pipeline_type='1024_cascade',
-                vram_profile=args.vram_profile, profile_stages=True, return_metrics=True,
+                image, seed=args.seed, pipeline_type='512' if args.vram_profile == '8gb' else '1024_cascade',
+                vram_profile=args.vram_profile, profile_stages=args.vram_profile != '8gb', return_metrics=True,
                 max_num_tokens=args.max_num_tokens, decoder_chunk_size=args.decoder_chunk_size)
         report['run_metrics'] = metrics
         mesh = outputs[0]
-        if args.texture_diagnostics:
+        if args.texture_diagnostics or args.texture_trace:
             with profiler.stage('texture_diagnostics'):
                 report['decoded_voxel_channels'] = texture_channel_stats(mesh)
         with profiler.stage('mesh_simplify'):
@@ -115,6 +123,9 @@ def main():
                 remesh=True, remesh_band=1, remesh_project=0, use_tqdm=True)
         with profiler.stage('export'):
             glb.export(str(output / 'asset.glb'), extension_webp=True)
+        if args.texture_trace:
+            from scripts.texture_diagnostics import baked_metallic_stats
+            report['baked_metallic'] = baked_metallic_stats(output / 'asset.glb')
         report['status'] = 'ok'
     except Exception as exc:
         report['error'] = dict(type=type(exc).__name__, message=str(exc))
@@ -134,7 +145,7 @@ def main():
         peak = report['peak_vram_reserved_bytes']
         if report['status'] == 'ok' and peak is not None:
             report['target_met'] = (peak <= 6.5 * 1024**3 and
-                                    report['run_metrics']['output_resolution'] == 1024)
+                                    report['run_metrics'].get('output_resolution') == 1024)
         (output / 'metrics.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
         print(json.dumps(report, indent=2))
 
