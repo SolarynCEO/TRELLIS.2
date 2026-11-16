@@ -612,6 +612,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         vram_profile: Optional[str] = None,
         profile_stages: bool = False,
         decoder_chunk_size: Optional[int] = None,
+        texture_compare_only: bool = False,
     ) -> List[MeshWithVoxel]:
         """
         Run the pipeline.
@@ -631,10 +632,14 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             vram_profile (str): Optional VRAM profile preset. Supported: '8gb', '8gb_1024'.
             profile_stages (bool): Detailed 1024 cascade profiling, including extraction.
             decoder_chunk_size (int): Pointwise projection rows for 8gb_1024 (default 32768).
+            texture_compare_only (bool): Diagnostic: decode texture with shape guidance,
+                skip mesh extraction/fill/bake, return empty outputs and optional metrics.
         """
         run_start_time = time.perf_counter()
         profile_name = self._resolve_vram_profile(vram_profile if vram_profile is not None else self.vram_profile)
-        if profile_name == '8gb_1024' or profile_stages:
+        if texture_compare_only and (profile_name not in (None, '8gb_1024') or (profile_name is None and self.low_vram)):
+            raise ValueError('texture_compare_only requires none with low_vram off, or 8gb_1024')
+        if profile_name == '8gb_1024' or profile_stages or texture_compare_only:
             from .low_vram_1024 import run_1024
             return run_1024(
                 self, image, profile_name=profile_name, pipeline_type=pipeline_type,
@@ -643,6 +648,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 max_num_tokens=max_num_tokens, decoder_chunk_size=decoder_chunk_size,
                 sparse_params=sparse_structure_sampler_params,
                 shape_params=shape_slat_sampler_params, tex_params=tex_slat_sampler_params,
+                texture_compare_only=texture_compare_only,
             )
         if getattr(self, '_models_offloaded_for_1024', False) and not self.low_vram:
             self.to(self.device)

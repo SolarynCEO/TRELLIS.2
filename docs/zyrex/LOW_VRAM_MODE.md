@@ -1,5 +1,71 @@
 # TRELLIS.2 Low-VRAM Profiles for Zyrex Fork
 
+## Upstream versus optimized texture-only diagnostic
+
+`scripts/profile_1024_vram.py --texture-compare-only` runs 1024 cascade through
+texture flow sampling, shape subdivision-guidance decode and texture decode.
+It exits **before mesh extraction, fill_holes, simplification, baking or export**.
+Shape guidance is computed by the existing shape decoder; only its mesh-conversion
+step is bypassed. No GLB is produced. `metrics.json` contains `texture_trace`,
+per-stage synchronized wall times and allocator peaks, even on failure.
+`target_met` stays null because this is not an end-to-end generation benchmark.
+
+The baseline requires `--vram-profile none --low-vram off`: original cascade
+sampling, full model residency, no decoder streaming/chunking and no profile
+autocast. The optimized run uses the existing `8gb_1024` settings. Precision
+override flags and `ZYREX_LOW_VRAM_DTYPE` are rejected in this diagnostic.
+The baseline may spill into Windows shared GPU memory or OOM; shared-memory
+use is acceptable for this diagnostic, not evidence of meeting the 8 GB target.
+The code does not force spilling or alter Windows memory policy.
+
+Run these as separate processes with the same local image/checkpoint and seed.
+No channels, materials, weights or production defaults are modified:
+
+```powershell
+Set-Location C:\dev\TRELLIS.2
+git fetch origin feat/low-vram-1024
+git switch feat/low-vram-1024
+git pull --ff-only origin feat/low-vram-1024
+Remove-Item Env:CUDA_VISIBLE_DEVICES -ErrorAction SilentlyContinue
+Remove-Item Env:ZYREX_LOW_VRAM_DTYPE -ErrorAction SilentlyContinue
+Remove-Item Env:ZYREX_VRAM_PROFILE -ErrorAction SilentlyContinue
+Remove-Item Env:ZYREX_LOW_VRAM -ErrorAction SilentlyContinue
+$python = 'C:\dev\TRELLIS.2\.venv\Scripts\python.exe'
+$image = 'C:\dev\bench\warlord_reference.jpg'
+$model = 'C:\Users\Dakota\.cache\huggingface\hub\models--microsoft--TRELLIS.2-4B\snapshots\af44b45f2e35a493886929c6d786e563ec68364d'
+$env:HF_HUB_OFFLINE = '1'
+& $python scripts\profile_1024_vram.py --image $image --model-id $model `
+  --seed 42 --vram-profile none --low-vram off --max-num-tokens 49152 `
+  --texture-compare-only --output-dir C:\dev\bench\texture_compare_upstream
+& $python scripts\profile_1024_vram.py --image $image --model-id $model `
+  --seed 42 --vram-profile 8gb_1024 --max-num-tokens 49152 `
+  --decoder-chunk-size 32768 --texture-compare-only `
+  --output-dir C:\dev\bench\texture_compare_optimized
+& $python scripts\compare_texture_predictions.py `
+  --upstream C:\dev\bench\texture_compare_upstream\metrics.json `
+  --optimized C:\dev\bench\texture_compare_optimized\metrics.json `
+  --output C:\dev\bench\texture_compare_diff.json
+```
+
+Trace schema v2 records the preprocessed image bytes/mode/size fingerprint,
+512/1024 positive/negative conditioning token hashes and moments, final shape
+SLat coordinate/features hashes and moments, texture initial noise hashes and
+moments, effective sampler settings (including defaults), normalized texture
+prediction, denormalized decoder input and all six raw decoder channels.
+Hashes include tensor dtype and shape as well as exact bytes. Hooks retain
+statistics, not tensors. Copying/hashing affects timing.
+
+The CPU comparator emits side-by-side trace values and stage timings, and the
+first observed divergent boundary. Missing boundaries mark the report incomplete
+and prevent claiming the earliest divergence. Exact differences do not establish
+causality or material correctness; different upstream/optimized precision may
+cause conditioning differences before sampling. The baked-metallic GPU regression
+remains a separate gate and cannot be evaluated without a GLB.
+
+CPU tests cover mocked early-exit orchestration for both profiles, bypassing native
+mesh conversion, trace fingerprints, argument validation, and comparison schema.
+No GPU execution or memory/quality claim is implied by those tests.
+
 This fork adds an opt-in low-VRAM profile intended to make image-to-3D generation practical on GPUs with 8 GB VRAM (for example, RTX 4070 Laptop GPUs), while keeping default behavior unchanged unless explicitly enabled.
 
 ## What this mode does

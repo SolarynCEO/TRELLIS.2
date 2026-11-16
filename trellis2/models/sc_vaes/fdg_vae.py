@@ -81,10 +81,14 @@ class FlexiDualGridVaeDecoder(SparseUnetVaeDecoder):
     def set_resolution(self, resolution: int) -> None:
         self.resolution = resolution
         
-    def forward(self, x: sp.SparseTensor, gt_intersected: sp.SparseTensor = None, **kwargs):
+    def forward(self, x: sp.SparseTensor, gt_intersected: sp.SparseTensor = None, skip_mesh: bool = False, **kwargs):
         profiler = getattr(self, 'stage_profiler', None)
         with profiler.stage('shape_decode') if profiler is not None else nullcontext():
             decoded = super().forward(x, **kwargs)
+        if skip_mesh:
+            if self.training:
+                raise ValueError("skip_mesh is an inference-only diagnostic")
+            return decoded
         if self.training:
             h, subs_gt, subs = decoded
             vertices = h.replace((1 + 2 * self.voxel_margin) * F.sigmoid(h.feats[..., 0:3]) - self.voxel_margin)

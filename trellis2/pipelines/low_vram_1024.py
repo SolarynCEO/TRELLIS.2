@@ -14,8 +14,10 @@ from ..utils.memory import StageProfiler, chunk_ranges
 
 def run_1024(pipeline, image, *, profile_name, pipeline_type, num_samples, seed,
              preprocess_image, return_latent, return_metrics, max_num_tokens,
-             decoder_chunk_size, sparse_params, shape_params, tex_params):
+             decoder_chunk_size, sparse_params, shape_params, tex_params, texture_compare_only=False):
     optimized = profile_name == '8gb_1024'
+    if texture_compare_only and return_latent:
+        raise ValueError('texture_compare_only returns diagnostics, not retained latents')
     if profile_name not in (None, '8gb_1024'):
         raise ValueError('Detailed 1024 profiling supports none or 8gb_1024')
     if pipeline_type not in (None, '1024_cascade'):
@@ -145,6 +147,21 @@ def run_1024(pipeline, image, *, profile_name, pipeline_type, num_samples, seed,
         if optimized:
             del cond_1024, coords
             release_cache()
+        if texture_compare_only:
+            # Decode subdivision guidance using the same shape decoder forward,
+            # but bypass its mesh conversion (and every later mesh/bake stage).
+            decoder = pipeline.models['shape_slat_decoder']
+            decoder.set_resolution(1024)
+            _, subs = stage('shape_decode_guidance', lambda: decoder(
+                shape_slat, return_subs=True, skip_mesh=True))
+            del _
+            if optimized:
+                del shape_slat
+                release_cache()
+            stage('texture_decode', lambda: pipeline.decode_tex_slat(tex_slat, subs))
+            stats.update(status='ok', output_resolution=1024,
+                         diagnostic_only=True, stopped_after='texture_decode')
+            return ([], stats) if return_metrics else []
         meshes, subs = stage('shape_decode_and_extract', lambda: pipeline.decode_shape_slat(shape_slat, 1024))
         if optimized and not return_latent:
             del shape_slat
@@ -181,7 +198,7 @@ def run_1024(pipeline, image, *, profile_name, pipeline_type, num_samples, seed,
             stats.update(profiler.peaks(), total_time_s=time.perf_counter() - started)
             # Pipeline-only result; the benchmark additionally includes bake/export.
             peak = stats['peak_vram_reserved_bytes']
-            stats['target_met'] = (peak <= 6.5 * 1024**3) if peak is not None and stats['status'] == 'ok' else None
+            stats['target_met'] = (peak <= 6.5 * 1024**3) if peak is not None and stats['status'] == 'ok' and not texture_compare_only else None
     if return_latent and return_metrics:
         return outputs, (shape_slat, tex_slat, 1024), stats
     if return_latent:

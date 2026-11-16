@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import struct
 import hashlib
+import inspect
 
 
 def tensor_fingerprint(value):
@@ -96,17 +97,58 @@ def trace_texture(pipeline, report):
     report['texture_normalization'] = pipeline.tex_slat_normalization
     report['decode_transform'] = 'raw * 0.5 + 0.5 (no clamp)'
     report['checkpoint_models'] = getattr(pipeline, '_pretrained_args', {}).get('models', {})
+    report['schema_version'] = 2
+    saved_methods = {}
+
+    def wrap(name, factory):
+        original_method = getattr(pipeline, name)
+        saved_methods[name] = (name in vars(pipeline), vars(pipeline).get(name))
+        setattr(pipeline, name, factory(original_method))
+
+    def preprocessing(original_method):
+        def call(*args, **kwargs):
+            image = original_method(*args, **kwargs)
+            report['preprocessed_image'] = dict(mode=image.mode, size=list(image.size),
+                sha256=hashlib.sha256(str((image.mode, image.size)).encode() + image.tobytes()).hexdigest())
+            return image
+        return call
+
+    def conditioning(original_method):
+        def call(image, resolution, *args, **kwargs):
+            result = original_method(image, resolution, *args, **kwargs)
+            report[f'conditioning_{resolution}'] = {
+                key: dict(sha256=tensor_fingerprint(value), moments=tensor_stats(value))
+                for key, value in result.items()}
+            return result
+        return call
+
+    def texture_sampling(original_method):
+        def call(cond, model, shape, *args, **kwargs):
+            report['shape_slat'] = dict(coords_sha256=tensor_fingerprint(shape.coords),
+                feats_sha256=tensor_fingerprint(shape), moments=tensor_stats(shape))
+            return original_method(cond, model, shape, *args, **kwargs)
+        return call
 
     def sample(model, noise, **kwargs):
         import torch
         report['flow_model'] = next((name for name, m in pipeline.models.items() if m is model), 'unknown')
         report['flow_precision'] = model_precision(model)
         report['noise'] = tensor_stats(noise)
+        report['noise_sha256'] = tensor_fingerprint(noise)
+        report['noise_coords_sha256'] = tensor_fingerprint(noise.coords)
         for key in ('cond', 'neg_cond', 'concat_cond'):
             if key in kwargs:
                 report[key] = tensor_stats(kwargs[key])
+                report[key + '_sha256'] = tensor_fingerprint(kwargs[key])
         report['sampler_params'] = {k: v for k, v in kwargs.items()
                                     if isinstance(v, (str, int, float, bool, type(None), list, tuple))}
+        # Include defaults that the caller did not explicitly pass, without tensors.
+        for key, parameter in inspect.signature(original).parameters.items():
+            if parameter.default is not inspect.Parameter.empty:
+                value = kwargs.get(key, parameter.default)
+                if isinstance(value, (str, int, float, bool, type(None), list, tuple)):
+                    report['sampler_params'][key] = value
+        report['sampler_params']['sigma_min'] = getattr(sampler, 'sigma_min', None)
         def flow_before(module, args):
             if 'flow_forward_precision' not in report:
                 device_type = args[0].device.type
@@ -134,15 +176,24 @@ def trace_texture(pipeline, report):
 
     def after(module, args, output):
         report['raw_decoder_output'] = tensor_stats(output)
+        report['raw_decoder_output_sha256'] = tensor_fingerprint(output)
         report['scaled_decoder_output'] = tensor_stats(output, scale=0.5, offset=0.5)
 
     handles = []
     try:
+        wrap('preprocess_image', preprocessing)
+        wrap('get_cond', conditioning)
+        wrap('sample_tex_slat', texture_sampling)
         sampler.sample = sample
         handles.append(decoder.register_forward_pre_hook(before))
         handles.append(decoder.register_forward_hook(after))
         yield
     finally:
+        for name, (had_value, value) in saved_methods.items():
+            if had_value:
+                setattr(pipeline, name, value)
+            else:
+                delattr(pipeline, name)
         for handle in handles:
             handle.remove()
         if had_override:

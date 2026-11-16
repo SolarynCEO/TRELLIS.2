@@ -29,7 +29,18 @@ def parse_args(argv=None):
                         help='Diagnostic arithmetic-only decoder precision override; fp32 may exceed 8 GB.')
     parser.add_argument('--texture-flow-autocast', choices=['profile', 'checkpoint'], default='profile',
                         help='Diagnostic: checkpoint disables extra autocast only during texture sampling.')
-    return parser.parse_args(argv)
+    parser.add_argument('--texture-compare-only', action='store_true',
+                        help='Trace through texture decode, skipping all mesh extraction and baking.')
+    args = parser.parse_args(argv)
+    if args.texture_compare_only:
+        if os.environ.get('ZYREX_LOW_VRAM_DTYPE'):
+            parser.error('clear ZYREX_LOW_VRAM_DTYPE for an unmodified texture comparison')
+        if args.vram_profile == '8gb' or (args.vram_profile == 'none' and args.low_vram != 'off'):
+            parser.error('texture comparison requires none --low-vram off, or 8gb_1024')
+        if args.texture_decoder_dtype != 'checkpoint' or args.texture_flow_autocast != 'profile':
+            parser.error('texture comparison does not allow precision overrides')
+        args.texture_trace = True
+    return args
 
 
 def texture_channel_stats(mesh):
@@ -90,7 +101,6 @@ def main():
         if not torch.cuda.is_available():
             raise RuntimeError('CUDA is required for real VRAM profiling; no measurements were taken')
         from PIL import Image
-        import o_voxel
         from trellis2.pipelines import Trellis2ImageTo3DPipeline
         profiler = StageProfiler(torch.device('cuda'), cuda_active=True,
                                  empty_cache=args.vram_profile == '8gb_1024')
@@ -117,8 +127,13 @@ def main():
             outputs, metrics = pipeline.run(
                 image, seed=args.seed, pipeline_type='512' if args.vram_profile == '8gb' else '1024_cascade',
                 vram_profile=args.vram_profile, profile_stages=args.vram_profile != '8gb', return_metrics=True,
-                max_num_tokens=args.max_num_tokens, decoder_chunk_size=args.decoder_chunk_size)
+                max_num_tokens=args.max_num_tokens, decoder_chunk_size=args.decoder_chunk_size,
+                texture_compare_only=args.texture_compare_only)
         report['run_metrics'] = metrics
+        if args.texture_compare_only:
+            report.update(status='ok', diagnostic_only=True, stopped_after='texture_decode')
+            return
+        import o_voxel
         mesh = outputs[0]
         if args.texture_diagnostics or args.texture_trace:
             with profiler.stage('texture_diagnostics'):
@@ -155,7 +170,7 @@ def main():
             values.extend(value for value in (pipeline_peak, outer_peak) if value is not None)
             report[key] = max(values, default=None)
         peak = report['peak_vram_reserved_bytes']
-        if report['status'] == 'ok' and peak is not None:
+        if report['status'] == 'ok' and peak is not None and not args.texture_compare_only:
             report['target_met'] = (peak <= 6.5 * 1024**3 and
                                     report['run_metrics'].get('output_resolution') == 1024)
         (output / 'metrics.json').write_text(json.dumps(report, indent=2), encoding='utf-8')

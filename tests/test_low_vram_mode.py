@@ -548,12 +548,22 @@ def test_texture_trace_captures_conditioning_and_single_normalization(pipeline_c
             torch.testing.assert_close(slat.feats, torch.tensor([[4., -1.]]))
             return slat.replace(torch.tensor([[-1., 0., 1., -0.8, 0.6, 1.]]))
     pipeline.models['tex_slat_decoder'] = Decoder()
+    pipeline.preprocess_image = lambda image: image.convert('RGB')
+    pipeline.get_cond = lambda image, resolution: {'cond': torch.tensor([[float(resolution)]]), 'neg_cond': torch.zeros(1, 1)}
     report = {}
     with trace_texture(pipeline, report):
+        image = pipeline.preprocess_image(Image.new('RGB', (8, 8)))
+        pipeline.get_cond([image], resolution)
         latent = pipeline.sample_tex_slat({'cond': torch.tensor([[float(resolution)]])}, flow, shape)
         decoded = pipeline.decode_tex_slat(latent, [])
     torch.testing.assert_close(decoded.feats, torch.tensor([[0., 0.5, 1., 0.1, 0.8, 1.]]))
     assert report['flow_model'] == f'tex_slat_flow_model_{resolution}'
+    assert report['schema_version'] == 2
+    assert report['preprocessed_image']['size'] == [8, 8]
+    assert len(report[f'conditioning_{resolution}']['cond']['sha256']) == 64
+    assert len(report['noise_sha256']) == len(report['shape_slat']['coords_sha256']) == 64
+    assert report['shape_slat']['moments']['channels'][0]['mean'] == 5
+    assert len(report['concat_cond_sha256']) == len(report['raw_decoder_output_sha256']) == 64
     assert report['predicted_normalized_tex_slat']['channels'][0]['mean'] == 2
     assert report['decoder_input_denormalized_tex_slat']['channels'][0]['mean'] == 4
     assert report['raw_decoder_output']['channels'][3]['mean'] == pytest.approx(-0.8)
@@ -594,3 +604,50 @@ def test_decoder_precision_conversion_updates_features_and_weights(pipeline_cls)
     assert seen == [torch.float16, torch.float32, torch.float16]
     # Checkpoint input/output projections stay FP32 in the mixed-precision design.
     assert decoder.from_latent.weight.dtype == decoder.output_layer.weight.dtype == torch.float32
+
+
+@pytest.mark.parametrize('profile', ['none', '8gb_1024'])
+def test_texture_compare_exits_before_mesh_operations(monkeypatch, pipeline_cls, profile):
+    pipeline, sampled = _synthetic_1024(monkeypatch, pipeline_cls)
+    calls = []
+    decoder = pipeline.models['shape_slat_decoder']
+    decoder.set_resolution = lambda value: calls.append(('resolution', value))
+    def forward(slat, **kwargs):
+        assert kwargs == dict(return_subs=True, skip_mesh=True)
+        calls.append('shape_guidance')
+        return 'discarded shape output', ['guidance']
+    decoder.forward = forward
+    pipeline.sample_shape_slat_cascade = lambda *args: (types.SimpleNamespace(coords=torch.zeros(2, 4)), 1024)
+    def forbidden(*args, **kwargs):
+        pytest.fail('mesh extraction/finalization must not run')
+    pipeline.decode_shape_slat = forbidden
+    from trellis2.pipelines import low_vram_1024
+    monkeypatch.setattr(low_vram_1024, 'MeshWithVoxel', forbidden)
+    def texture(slat, subs):
+        assert subs == ['guidance']
+        calls.append('texture_decode')
+        return []
+    pipeline.decode_tex_slat = texture
+    outputs, stats = pipeline.run(Image.new('RGB', (8, 8)), vram_profile=profile,
+                                  texture_compare_only=True, return_metrics=True)
+    assert outputs == [] and calls[-2:] == ['shape_guidance', 'texture_decode']
+    assert stats['diagnostic_only'] and stats['stopped_after'] == 'texture_decode'
+    assert stats['status'] == 'ok' and stats['target_met'] is None
+    assert all(stage['time_s'] >= 0 for stage in stats['stage_metrics'])
+    assert not any(stage['stage'] in ('mesh_extraction', 'mesh_finalize') for stage in stats['stage_metrics'])
+    if profile == 'none':
+        assert not stats['low_vram'] and stats['autocast_dtype'] is None
+        assert all('retain_history' not in params for params in sampled)
+    assert not hasattr(decoder, 'stream_device')
+
+
+def test_shape_decoder_skip_mesh_preserves_guidance(monkeypatch, pipeline_cls):
+    from trellis2.models.sc_vaes import fdg_vae
+    from trellis2.models.sc_vaes.sparse_unet_vae import SparseUnetVaeDecoder
+    decoder = fdg_vae.FlexiDualGridVaeDecoder(1024, [4], 2, [0], ['unused'], [], [{}]).eval()
+    guidance = object()
+    monkeypatch.setattr(SparseUnetVaeDecoder, 'forward', lambda *a, **kw: ('raw', guidance))
+    def forbidden(*args, **kwargs):
+        pytest.fail('native mesh conversion must not run')
+    monkeypatch.setattr(fdg_vae, 'flexible_dual_grid_to_mesh', forbidden)
+    assert decoder(None, skip_mesh=True, return_subs=True) == ('raw', guidance)

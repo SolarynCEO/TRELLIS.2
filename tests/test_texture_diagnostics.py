@@ -105,3 +105,41 @@ def test_comparison_requires_matching_latent_and_coordinate_fingerprints():
     assert summary['decoder_fp32']['same_decoder_input_as_baseline_1024'] is True
     assert summary['changed']['same_decoder_input_as_baseline_1024'] is False
     assert summary['baseline_1024']['raw_decoder_metallic']['mean'] == 0.999
+
+
+def test_compare_cli_rejects_invalid_modes(monkeypatch):
+    from scripts.profile_1024_vram import parse_args
+    monkeypatch.delenv('ZYREX_LOW_VRAM_DTYPE', raising=False)
+    base = ['--image', 'fixture.png', '--output-dir', 'out', '--texture-compare-only']
+    assert parse_args(base).texture_trace
+    assert parse_args(base + ['--vram-profile', 'none', '--low-vram', 'off']).texture_compare_only
+    for extra in (['--vram-profile', '8gb'], ['--vram-profile', 'none'],
+                  ['--texture-decoder-dtype', 'fp32'], ['--texture-flow-autocast', 'checkpoint']):
+        with pytest.raises(SystemExit):
+            parse_args(base + extra)
+
+
+def test_prediction_diff_schema_and_missing_data():
+    import copy
+    from scripts.compare_texture_predictions import compare
+    t = dict(preprocessed_image={'sha256': 'image'},
+             shape_slat={'coords_sha256': 'coords', 'feats_sha256': 'shape'},
+             sampler_params={key: 1 for key in ('steps', 'guidance_strength', 'guidance_rescale', 'guidance_interval', 'rescale_t', 'sigma_min')})
+    for resolution in (512, 1024):
+        t[f'conditioning_{resolution}'] = {key: {'sha256': key} for key in ('cond', 'neg_cond')}
+    for key in ('noise_sha256', 'noise_coords_sha256', 'concat_cond_sha256',
+                'predicted_normalized_tex_slat_sha256', 'decoder_input_sha256',
+                'decoder_input_coords_sha256', 'raw_decoder_output_sha256'):
+        t[key] = key
+    a = dict(status='ok', texture_trace=t, stage_metrics=[dict(stage='texture_decode', time_s=1, status='ok')])
+    b = copy.deepcopy(a)
+    assert compare(a, b)['complete'] and compare(a, b)['first_divergence'] is None
+    b['texture_trace']['noise_sha256'] = 'changed'
+    result = compare(a, b)
+    assert result['first_divergence'] == 'texture_initial_noise'
+    assert result['stage_wall_times']['upstream'][0]['time_s'] == 1
+    assert json.loads(json.dumps(result)) == result
+    del b['texture_trace']['preprocessed_image']
+    result = compare(a, b)
+    assert not result['complete'] and result['first_divergence'] is None
+    assert result['first_observed_divergence'] == 'texture_initial_noise'
