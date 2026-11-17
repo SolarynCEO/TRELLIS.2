@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from typing import *
 import torch
 import torch.nn as nn
@@ -80,8 +81,14 @@ class FlexiDualGridVaeDecoder(SparseUnetVaeDecoder):
     def set_resolution(self, resolution: int) -> None:
         self.resolution = resolution
         
-    def forward(self, x: sp.SparseTensor, gt_intersected: sp.SparseTensor = None, **kwargs):
-        decoded = super().forward(x, **kwargs)
+    def forward(self, x: sp.SparseTensor, gt_intersected: sp.SparseTensor = None, skip_mesh: bool = False, **kwargs):
+        profiler = getattr(self, 'stage_profiler', None)
+        with profiler.stage('shape_decode') if profiler is not None else nullcontext():
+            decoded = super().forward(x, **kwargs)
+        if skip_mesh:
+            if self.training:
+                raise ValueError("skip_mesh is an inference-only diagnostic")
+            return decoded
         if self.training:
             h, subs_gt, subs = decoded
             vertices = h.replace((1 + 2 * self.voxel_margin) * F.sigmoid(h.feats[..., 0:3]) - self.voxel_margin)
@@ -95,16 +102,17 @@ class FlexiDualGridVaeDecoder(SparseUnetVaeDecoder):
             )) for v, i, q in zip(vertices, gt_intersected, quad_lerp)]
             return mesh, vertices, intersected_logits, subs_gt, subs
         else:
-            out_list = list(decoded) if isinstance(decoded, tuple) else [decoded]
-            h = out_list[0]
-            vertices = h.replace((1 + 2 * self.voxel_margin) * F.sigmoid(h.feats[..., 0:3]) - self.voxel_margin)
-            intersected = h.replace(h.feats[..., 3:6] > 0)
-            quad_lerp = h.replace(F.softplus(h.feats[..., 6:7]))
-            mesh = [Mesh(*flexible_dual_grid_to_mesh(
-                v.coords[:, 1:], v.feats, i.feats, q.feats,
-                aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-                grid_size=self.resolution,
-                train=False
-            )) for v, i, q in zip(vertices, intersected, quad_lerp)]
-            out_list[0] = mesh
-            return out_list[0] if len(out_list) == 1 else tuple(out_list)
+            with profiler.stage('mesh_extraction') if profiler is not None else nullcontext():
+                out_list = list(decoded) if isinstance(decoded, tuple) else [decoded]
+                h = out_list[0]
+                vertices = h.replace((1 + 2 * self.voxel_margin) * F.sigmoid(h.feats[..., 0:3]) - self.voxel_margin)
+                intersected = h.replace(h.feats[..., 3:6] > 0)
+                quad_lerp = h.replace(F.softplus(h.feats[..., 6:7]))
+                mesh = [Mesh(*flexible_dual_grid_to_mesh(
+                    v.coords[:, 1:], v.feats, i.feats, q.feats,
+                    aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+                    grid_size=self.resolution,
+                    train=False
+                )) for v, i, q in zip(vertices, intersected, quad_lerp)]
+                out_list[0] = mesh
+                return out_list[0] if len(out_list) == 1 else tuple(out_list)

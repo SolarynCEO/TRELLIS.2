@@ -1,4 +1,148 @@
-# TRELLIS.2 Low-VRAM Mode (`8gb`) for Zyrex Fork
+# TRELLIS.2 Low-VRAM Profiles for Zyrex Fork
+
+## FP32 conditioning and optional 512 texture flow on 1024 shapes
+
+`8gb_1024` now runs **both image-conditioning resolutions in fp32 with autocast
+explicitly disabled**, through final feature normalization and conditioning-token
+creation. Encoder parameters/buffers are temporarily converted to fp32 and their
+original dtypes restored on success or failure. CPU offloading remains enabled.
+Flow sampling and decoder precision are unchanged. Profile-off and legacy `8gb`
+behavior are unchanged. Traces include actual encoder parameter dtypes and
+autocast state under `conditioning_precision_512` / `conditioning_precision_1024`.
+
+User laptop results at 29676ee: upstream compare-only completed in 5276 s,
+low_vram=false, no autocast; raw metallic min/mean/std/max was
+**-0.23251 / 0.98310 / 0.11245 / 1.04567**, versus optimized
+**0.96932 / 0.99913 / 0.00183 / 1.02200**. The first divergence was positive
+512 conditioning (maximum channel-mean difference 6.07e-4), followed by different
+token sets (13299 versus 13321). This establishes upstream metallic bias and
+motivates the conditioning change; it does not establish that conditioning alone
+caused every downstream difference.
+
+Validation targets for the new code are the upstream conditioning hash prefix
+`1a5289d1`, 13299 tokens / coordinate hash prefix `b7691c70`, raw metallic moving
+toward upstream, and **at most 6.5 GiB PyTorch peak reserved through bake/export**.
+These are targets, **not measured results for this change**. Shape-flow precision
+still differs from upstream, so later matching is not guaranteed. Full hashes
+should be compared with the saved upstream report; prefixes are identification
+only. GPU validation remains pending; CPU tests cannot establish memory fit.
+
+Optional `--texture-resolution 512` (API `texture_resolution=512`) selects the
+512 texture flow and its 512 image-conditioning tokens on the **unchanged 1024
+shape latent/coordinates**. It does not rescale, reindex or regenerate the shape,
+change normalization, replace the decoder or change texture-map pixel dimensions.
+This is an experimental use of the 512 checkpoint outside its usual spatial
+distribution. Its material quality and memory use require measurement. Omit the
+option for the existing 1024 texture flow; `--texture-resolution 1024` is explicit
+equivalent selection. It is supported only with 1024 cascade. Run metrics record
+the selected texture resolution/model and actual output resolution separately.
+
+After updating the PR branch, use these PowerShell commands for full runs so the
+reported peak includes bake/export. Reuse the same cached model, seed and image:
+
+```powershell
+Set-Location C:\dev\TRELLIS.2
+git fetch origin feat/low-vram-1024
+git switch feat/low-vram-1024
+git pull --ff-only origin feat/low-vram-1024
+Remove-Item Env:CUDA_VISIBLE_DEVICES -ErrorAction SilentlyContinue
+Remove-Item Env:ZYREX_LOW_VRAM_DTYPE -ErrorAction SilentlyContinue
+$env:ZYREX_RASTER_IMPL = 'triton'
+$python = 'C:\dev\TRELLIS.2\.venv\Scripts\python.exe'
+$model = 'C:\Users\Dakota\.cache\huggingface\hub\models--microsoft--TRELLIS.2-4B\snapshots\af44b45f2e35a493886929c6d786e563ec68364d'
+& $python scripts\profile_1024_vram.py --model-id $model `
+  --image C:\dev\bench\warlord_reference.jpg --seed 42 --vram-profile 8gb_1024 `
+  --max-num-tokens 49152 --decoder-chunk-size 32768 --baker zyrex `
+  --texture-size 2048 --decimation-target 500000 --texture-trace `
+  --output-dir C:\dev\bench\fp32_conditioning_1024tex
+& $python scripts\profile_1024_vram.py --model-id $model `
+  --image C:\dev\bench\warlord_reference.jpg --seed 42 --vram-profile 8gb_1024 `
+  --max-num-tokens 49152 --decoder-chunk-size 32768 --baker zyrex `
+  --texture-size 2048 --decimation-target 500000 --texture-trace `
+  --texture-resolution 512 --output-dir C:\dev\bench\fp32_conditioning_512tex
+& $python scripts\compare_texture_predictions.py `
+  --upstream C:\dev\bench\texture_compare_upstream\metrics.json `
+  --optimized C:\dev\bench\fp32_conditioning_1024tex\metrics.json `
+  --output C:\dev\bench\fp32_conditioning_diff.json
+$report = Get-Content C:\dev\bench\fp32_conditioning_1024tex\metrics.json -Raw | ConvertFrom-Json
+$report | Select-Object status, target_met, `
+  @{Name='AllocatedGiB';Expression={$_.peak_vram_allocated_bytes / 1GB}}, `
+  @{Name='ReservedGiB';Expression={$_.peak_vram_reserved_bytes / 1GB}}
+$report.texture_trace.conditioning_512.cond.sha256
+$report.run_metrics.num_tokens_1024
+$report.texture_trace.shape_slat.coords_sha256
+$report.texture_trace.raw_decoder_output.channels[3]
+```
+
+Either run also accepts `--texture-compare-only` to skip mesh/bake; its
+`target_met` remains null and its peak cannot validate full-generation headroom.
+No channel swaps, clamping, asset-specific behavior or new dependencies are used.
+
+## Upstream versus optimized texture-only diagnostic
+
+`scripts/profile_1024_vram.py --texture-compare-only` runs 1024 cascade through
+texture flow sampling, shape subdivision-guidance decode and texture decode.
+It exits **before mesh extraction, fill_holes, simplification, baking or export**.
+Shape guidance is computed by the existing shape decoder; only its mesh-conversion
+step is bypassed. No GLB is produced. `metrics.json` contains `texture_trace`,
+per-stage synchronized wall times and allocator peaks, even on failure.
+`target_met` stays null because this is not an end-to-end generation benchmark.
+
+The baseline requires `--vram-profile none --low-vram off`: original cascade
+sampling, full model residency, no decoder streaming/chunking and no profile
+autocast. The optimized run uses the existing `8gb_1024` settings. Precision
+override flags and `ZYREX_LOW_VRAM_DTYPE` are rejected in this diagnostic.
+The baseline may spill into Windows shared GPU memory or OOM; shared-memory
+use is acceptable for this diagnostic, not evidence of meeting the 8 GB target.
+The code does not force spilling or alter Windows memory policy.
+
+Run these as separate processes with the same local image/checkpoint and seed.
+No channels, materials, weights or production defaults are modified:
+
+```powershell
+Set-Location C:\dev\TRELLIS.2
+git fetch origin feat/low-vram-1024
+git switch feat/low-vram-1024
+git pull --ff-only origin feat/low-vram-1024
+Remove-Item Env:CUDA_VISIBLE_DEVICES -ErrorAction SilentlyContinue
+Remove-Item Env:ZYREX_LOW_VRAM_DTYPE -ErrorAction SilentlyContinue
+Remove-Item Env:ZYREX_VRAM_PROFILE -ErrorAction SilentlyContinue
+Remove-Item Env:ZYREX_LOW_VRAM -ErrorAction SilentlyContinue
+$python = 'C:\dev\TRELLIS.2\.venv\Scripts\python.exe'
+$image = 'C:\dev\bench\warlord_reference.jpg'
+$model = 'C:\Users\Dakota\.cache\huggingface\hub\models--microsoft--TRELLIS.2-4B\snapshots\af44b45f2e35a493886929c6d786e563ec68364d'
+$env:HF_HUB_OFFLINE = '1'
+& $python scripts\profile_1024_vram.py --image $image --model-id $model `
+  --seed 42 --vram-profile none --low-vram off --max-num-tokens 49152 `
+  --texture-compare-only --output-dir C:\dev\bench\texture_compare_upstream
+& $python scripts\profile_1024_vram.py --image $image --model-id $model `
+  --seed 42 --vram-profile 8gb_1024 --max-num-tokens 49152 `
+  --decoder-chunk-size 32768 --texture-compare-only `
+  --output-dir C:\dev\bench\texture_compare_optimized
+& $python scripts\compare_texture_predictions.py `
+  --upstream C:\dev\bench\texture_compare_upstream\metrics.json `
+  --optimized C:\dev\bench\texture_compare_optimized\metrics.json `
+  --output C:\dev\bench\texture_compare_diff.json
+```
+
+Trace schema v2 records the preprocessed image bytes/mode/size fingerprint,
+512/1024 positive/negative conditioning token hashes and moments, final shape
+SLat coordinate/features hashes and moments, texture initial noise hashes and
+moments, effective sampler settings (including defaults), normalized texture
+prediction, denormalized decoder input and all six raw decoder channels.
+Hashes include tensor dtype and shape as well as exact bytes. Hooks retain
+statistics, not tensors. Copying/hashing affects timing.
+
+The CPU comparator emits side-by-side trace values and stage timings, and the
+first observed divergent boundary. Missing boundaries mark the report incomplete
+and prevent claiming the earliest divergence. Exact differences do not establish
+causality or material correctness; different upstream/optimized precision may
+cause conditioning differences before sampling. The baked-metallic GPU regression
+remains a separate gate and cannot be evaluated without a GLB.
+
+CPU tests cover mocked early-exit orchestration for both profiles, bypassing native
+mesh conversion, trace fingerprints, argument validation, and comparison schema.
+No GPU execution or memory/quality claim is implied by those tests.
 
 This fork adds an opt-in low-VRAM profile intended to make image-to-3D generation practical on GPUs with 8 GB VRAM (for example, RTX 4070 Laptop GPUs), while keeping default behavior unchanged unless explicitly enabled.
 
@@ -33,7 +177,7 @@ When `vram_profile="8gb"` is active, the pipeline:
 
 ## Default behavior compatibility
 
-- If you do **not** set `ZYREX_LOW_VRAM` and do **not** pass `vram_profile`, behavior remains unchanged from this fork's prior default path.
+- If you do **not** set `ZYREX_LOW_VRAM` or `ZYREX_VRAM_PROFILE` and do **not** pass `vram_profile`, behavior remains unchanged from this fork's prior default path.
 - Existing calls to `pipeline.run(...)` still work.
 
 ## Quality / speed tradeoffs
@@ -143,3 +287,268 @@ These are included in `requirements.txt` and `setup.sh --basic`.
 ## Important measurement note
 
 This repository's cloud CPU VM cannot produce real CUDA VRAM numbers. Treat all VRAM fit claims as **pending** until you run the benchmark on your target GPU and inspect the emitted JSON.
+
+## Experimental explicit 1024 cascade profile
+
+`pipeline.run(image, vram_profile="8gb_1024", return_metrics=True)` selects
+**1024_cascade without a 512 fallback**. Alternatively set
+`ZYREX_VRAM_PROFILE=8gb_1024` before creating/running the pipeline. An explicit
+`vram_profile="none"` disables environment profile selection. The existing
+`ZYREX_LOW_VRAM=1` / `8gb` behavior still defaults to 512.
+
+For app integration, set legacy offloading **before** moving the pipeline's
+execution device, so an all-model upload cannot OOM before `run()` starts:
+
+```python
+pipeline.low_vram = True
+pipeline.cuda()
+meshes, metrics = pipeline.run(image, vram_profile="8gb_1024", return_metrics=True)
+assert metrics["output_resolution"] == 1024
+```
+
+The goal is at most **6.5 GiB PyTorch peak reserved**. In a user-reported
+RTX 4070 Laptop 8 GB run, disabling autocast for cascade upsampling allowed
+completion in **256.5 s**, with **5.27 GiB allocated (peak at `bake`) / 5.93 GiB reserved
+(peak at `texture_decode`)**. These are laptop measurements supplied by the user, not CPU
+test results or a GPU run performed by the agent.
+
+**nvidia-smi peaked at 7,886 MiB** (about 7.70 GiB) while PyTorch reserved peaked
+at 5.93 GiB. `target_met` tests only PyTorch allocator reserved memory and completed
+1024 generation; it does **not** certify total-device headroom or material quality.
+The report explicitly labels `target_scope=pytorch_allocator_reserved_only`.
+The differing scopes and sampling times cannot establish an exact allocation
+breakdown. This single run does not guarantee other images fit.
+
+The user confirmed that metallic saturation starts in decoded voxels, before
+bake: warlord seed 42, channel 3 min 0.985, mean 0.9996, fraction >= 0.99
+0.99999; roughness varied with mean 0.82 and base color looked normal. The baked
+blue-channel ratio >= 0.95 was 0.9805. **The material issue remains unresolved.**
+It is not a GLB packing issue or a reason to swap channels or zero metallic.
+
+Source audit: both profiles use the same normalization functions. Shape SLat
+conditioning is normalized once; texture predictions are denormalized once;
+the decoder uses `raw * 0.5 + 0.5`, consistent with the PBR training render path.
+CPU tests cover nontrivial mean/scale values and both texture flow selections.
+Actual 512/1024 GPU latent predictions have not been compared by the agent.
+
+`--texture-trace` now records actual texture conditioning, normalized shape
+conditioning, normalized sampler predictions, denormalized decoder inputs,
+raw/scaled decoder channel moments, model identifiers, normalization vectors,
+decoded voxel statistics and the exported GLB blue-channel ratio. Statistics are
+copied to CPU in bounded chunks; model outputs are never edited. Trace runs add
+CPU transfers and are **not timing benchmarks**. Use `--vram-profile 8gb` for the
+512 reference and `--vram-profile 8gb_1024` for the cascade with the same seed.
+Matching seeds do not align individual noise/latent elements across different
+token counts and coordinate layouts.
+
+The opt-in profile:
+
+- Evicts idle models to CPU at entry and keeps sequential stage offloading.
+  It offloads models even if a caller previously placed them all on CUDA.
+- Disables Euler sampler prediction history. Ordinary sampler calls retain history.
+- Releases the low-resolution shape and upsampling intermediates before the
+  high-resolution flow, moves inactive high-resolution conditioning to CPU, and
+  drops conditioning and unrequested latents before later decodes.
+- Streams sparse decoder modules (input projection, each block, output projection)
+  to the execution device and back to CPU, including failed forwards. This can
+  substantially increase CPU transfer time and requires sufficient host RAM.
+- Chunks only the independent rows of the final layer-norm/linear projection.
+  `decoder_chunk_size=32768` is the default; override with the runtime argument or
+  `ZYREX_DECODER_CHUNK_SIZE`. Sparse convolutions, their caches, and mesh extraction
+  remain whole to preserve neighborhood/topology correctness.
+- Keeps decoder precision as configured in the checkpoint. Flow
+  autocast defaults to fp16, as in `8gb`; image conditioning uses fp32 with
+  autocast disabled. `ZYREX_LOW_VRAM_DTYPE=none|fp16|bf16`
+  controls it. Cascade upsampling runs without flow autocast to avoid a flex_gemm
+  fp32/fp16 operand mismatch. Numerical/visual parity still needs real validation.
+- Rejects multiple samples, conflicting pipeline types, invalid chunk sizes, and
+  a high-resolution token count above `max_num_tokens` (default 49152). It never
+  silently lowers resolution or discards tokens. Raising this cap increases risk.
+- Releases allocator caches between stages and streamed blocks. Configure
+  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` **before importing torch**.
+  Some Windows/PyTorch builds may warn that this is unsupported; the report records
+  the requested configuration, not proof it took effect.
+
+The original pipeline settings and temporary decoder attributes are restored on
+exit. Optimized runs leave models on CPU for baking; a subsequent run with profile
+disabled and `low_vram=False` restores full model residency automatically. For
+standalone calls to pipeline submethods after an optimized run, call `.to(device)`
+first if using `low_vram=False`. `return_latent=True` retains the requested latents
+and can increase peak memory; the benchmark uses the default `False`.
+
+### Stage profiling and failure reports
+
+`profile_stages=True` enables detailed profiling for `1024_cascade` with either
+`vram_profile="none"` (original cascade) or `"8gb_1024"`. Records include:
+conditioning at 512/1024, sparse structure, shape SLat at 512, cascade upsampling,
+shape SLat at 1024, texture SLat, shape decode, mesh extraction, texture decode,
+and mesh finalization. The optimized path also records coordinate quantization.
+Parent stage peaks include their children; **do not sum peaks or nested timings**.
+
+`scripts/profile_1024_vram.py` additionally measures model loading, mesh
+simplification, **bake**, and export. It writes `metrics.json` on success or failure
+after torch has imported, including completed stages and the failing stage when
+available. CUDA timings are synchronized. CPU counters are null. The report's
+`target_met` requires a completed 1024 output and an overall peak reserved at most
+6.5 GiB, including bake. `pipeline.last_run_stats` alone covers generation only.
+Metrics measure **PyTorch's allocator**, not direct native CUDA allocations or
+other processes; also observe total GPU usage on the laptop.
+
+### Exact laptop validation commands (PowerShell)
+
+Run baseline first, then optimized, in separate Python processes. Choose the same
+local warlord image when prompted. Neither the image nor generated outputs belong
+in a commit. These commands use existing TRELLIS.2 weights; no weights are modified.
+
+```powershell
+Set-Location C:\dev\TRELLIS.2
+git fetch origin feat/low-vram-1024
+git switch --create validate/low-vram-1024 --track origin/feat/low-vram-1024
+$warlordImage = Read-Host 'Absolute path to the local warlord image'
+Remove-Item Env:CUDA_VISIBLE_DEVICES -ErrorAction SilentlyContinue
+Remove-Item Env:ZYREX_LOW_VRAM_DTYPE -ErrorAction SilentlyContinue
+Remove-Item Env:PYTORCH_ALLOC_CONF -ErrorAction SilentlyContinue
+$env:PYTORCH_CUDA_ALLOC_CONF = 'expandable_segments:True'
+$env:ZYREX_RASTER_IMPL = 'torch'
+
+# Baseline with legacy low_vram OFF. It may OOM; keep metrics.json if so.
+& C:\dev\TRELLIS.2\.venv\Scripts\python.exe scripts\profile_1024_vram.py `
+  --image $warlordImage --vram-profile none --low-vram off `
+  --baker zyrex --seed 42 --texture-size 2048 --decimation-target 500000 `
+  --output-dir outputs\vram1024-baseline
+
+# Explicit 1024 profile; no implicit 512 downgrade.
+& C:\dev\TRELLIS.2\.venv\Scripts\python.exe scripts\profile_1024_vram.py `
+  --image $warlordImage --vram-profile 8gb_1024 `
+  --decoder-chunk-size 32768 --max-num-tokens 49152 `
+  --baker zyrex --seed 42 --texture-size 2048 --decimation-target 500000 `
+  --output-dir outputs\vram1024-optimized
+
+$report = Get-Content outputs\vram1024-optimized\metrics.json -Raw | ConvertFrom-Json
+$report | Select-Object status, target_met, peak_vram_allocated_bytes, peak_vram_reserved_bytes
+$report.stage_metrics | Select-Object stage, status, time_s, `
+  @{Name='AllocatedGiB';Expression={ if ($null -ne $_.peak_vram_allocated_bytes) { $_.peak_vram_allocated_bytes / 1GB } }}, `
+  @{Name='ReservedGiB';Expression={ if ($null -ne $_.peak_vram_reserved_bytes) { $_.peak_vram_reserved_bytes / 1GB } }}
+```
+
+For the default baker, repeat **both** commands with `--baker nvdiffrast` and new
+output directories. Do not compare different bakers as a profile-only comparison.
+Repeat multiple times, inspect GLBs visually, check resolution and all failed
+stages, and attach reports before declaring the 8 GB/6.5 GiB goal achieved.
+The script defaults to the existing nvdiffrast baker; no baker source is changed.
+
+CPU-only regression commands (no model downloads/generation):
+
+```powershell
+$env:CUDA_VISIBLE_DEVICES = ''
+& C:\dev\TRELLIS.2\.venv\Scripts\python.exe -m pytest `
+  tests\test_memory_management.py tests\test_low_vram_mode.py tests\test_sparse_attention_sdpa.py -q
+Remove-Item Env:CUDA_VISIBLE_DEVICES -ErrorAction SilentlyContinue
+```
+
+The CPU suite uses real small tensors for sampler and projection equivalence, and
+mocks optional native dependencies, generation/extraction, and CUDA counters for
+control-flow/accounting tests. Mock counters are not measured VRAM. No dependencies
+or major dependency versions are added or changed by this profile.
+
+
+### Opt-in real GPU smoke test
+
+The `gpu_smoke` pytest marker runs generation, baking and GLB export in an isolated
+process. It skips unless explicitly enabled and requires existing local weights;
+Hugging Face offline mode prevents downloads. It checks completion, not a universal
+VRAM/quality guarantee. It was **not run by the agent**.
+
+```powershell
+Remove-Item Env:CUDA_VISIBLE_DEVICES -ErrorAction SilentlyContinue
+$env:TRELLIS_RUN_GPU_SMOKE = '1'
+$env:TRELLIS_GPU_SMOKE_IMAGE = Read-Host 'Absolute path to local warlord image'
+$env:TRELLIS_GPU_SMOKE_MODEL = Read-Host 'Local TRELLIS.2 weights directory containing pipeline.json'
+$env:TRELLIS_GPU_SMOKE_BAKER = 'zyrex'
+& C:\dev\TRELLIS.2\.venv\Scripts\python.exe -m pytest tests\test_low_vram_gpu_smoke.py -m gpu_smoke -v
+Remove-Item Env:TRELLIS_RUN_GPU_SMOKE -ErrorAction SilentlyContinue
+```
+
+
+### Warlord metallic regression (GPU, opt-in)
+
+This test runs **both** 512 and 1024 with seed 42 in independent offline processes,
+saves both GLBs/reports and `comparison.json` under the pytest temp directory, then
+fails if either `baked_metallic.metallic_high_ratio` exceeds **0.5**. The ratio
+uses blue >= 0.95 over encoded metallic-roughness texture pixels (including UV
+padding), with the maximum ratio across materials; it is not surface-area-weighted.
+Material factors cannot hide saturation. The user-reported 0.9805 fails this gate.
+No GPU regression was run by the agent. It is expected to expose the unresolved
+bug until a supported fix is validated. No fixture or weights are committed.
+
+```powershell
+Remove-Item Env:CUDA_VISIBLE_DEVICES -ErrorAction SilentlyContinue
+$env:TRELLIS_RUN_WARLORD_REGRESSION = '1'
+$env:TRELLIS_WARLORD_IMAGE = Read-Host 'Absolute path to local warlord fixture'
+$env:TRELLIS_GPU_SMOKE_MODEL = Read-Host 'Local weights directory containing pipeline.json'
+$env:TRELLIS_GPU_SMOKE_BAKER = 'zyrex'
+& C:\dev\TRELLIS.2\.venv\Scripts\python.exe -m pytest tests\test_low_vram_gpu_smoke.py -m gpu_regression -v
+Remove-Item Env:TRELLIS_RUN_WARLORD_REGRESSION -ErrorAction SilentlyContinue
+```
+
+### Isolating texture flow precision from decoder precision
+
+The latest user run reports baked metallic_high_ratio **0.9813** and raw decoder
+channel 3 min **0.969**, mean **0.999**, std **0.0018**; the 32-channel texture
+latent is not collapsed and roughness varies. This is before output scaling.
+The saturation is still unresolved; the 0.5 warlord gate is unchanged.
+
+Inspection of cached Microsoft model config revision
+`af44b45f2e35a493886929c6d786e563ec68364d` shows separate 512/1024 texture flow
+checkpoints configured for **bf16**, but one shared `tex_dec_next_dc_f16c32_fp16`
+decoder (`SparseUnetVaeDecoder`, 32 input channels, 6 output channels, fp16 blocks).
+The decoder input/output projections remain fp32. This cached config is evidence
+about the model design, not proof of the exact config used by a particular run.
+The trace records the actual model paths and live dtypes.
+
+Flow `manual_cast` uses the configured bf16 dtype only when autocast is disabled;
+the profile normally requests fp16 autocast. This is a precision hypothesis, not
+evidence that fp16 causes the saturation. A concrete conversion bug was found:
+decoder `convert_to_fp32()` changed block weights but did not update `self.dtype`,
+so forward still cast features to fp16. Conversion methods now keep activation
+dtype and `use_fp16` synchronized with the block weights. Constructor defaults
+and the normal generation path are unchanged.
+
+Two benchmark-only switches isolate these questions:
+
+- `--texture-decoder-dtype fp32`: changes only the loaded texture decoder's block
+  arithmetic. It does not recover precision already lost when loading into fp16
+  parameters or change checkpoint files. **May exceed 8 GB**; it is not a new
+  production memory profile or a validated fix.
+- `--texture-flow-autocast checkpoint`: disables extra autocast only inside the
+  texture sampler so the existing flow uses its configured dtype (bf16 in the
+  inspected configs). Shape/conditioning stages and model parameters are unchanged.
+
+Run separate processes with the same input/seed/baker. These diagnostic switches
+are off by default. Trace overhead makes these quality comparisons unsuitable as
+performance measurements. Example from the engine repository root:
+
+```powershell
+$image = Read-Host 'Absolute path to local warlord fixture'
+$model = Read-Host 'Local weights directory containing pipeline.json'
+$env:HF_HUB_OFFLINE = '1'
+$env:TRANSFORMERS_OFFLINE = '1'
+$env:ZYREX_LOW_VRAM_DTYPE = 'fp16'
+Remove-Item Env:CUDA_VISIBLE_DEVICES -ErrorAction SilentlyContinue
+& C:\dev\TRELLIS.2\.venv\Scripts\python.exe scripts\profile_1024_vram.py --image $image --model-id $model --seed 42 --baker zyrex --texture-trace --vram-profile 8gb --output-dir outputs\texture-ablation\baseline_512
+& C:\dev\TRELLIS.2\.venv\Scripts\python.exe scripts\profile_1024_vram.py --image $image --model-id $model --seed 42 --baker zyrex --texture-trace --vram-profile 8gb_1024 --output-dir outputs\texture-ablation\baseline_1024
+& C:\dev\TRELLIS.2\.venv\Scripts\python.exe scripts\profile_1024_vram.py --image $image --model-id $model --seed 42 --baker zyrex --texture-trace --vram-profile 8gb_1024 --texture-decoder-dtype fp32 --output-dir outputs\texture-ablation\decoder_fp32
+& C:\dev\TRELLIS.2\.venv\Scripts\python.exe scripts\profile_1024_vram.py --image $image --model-id $model --seed 42 --baker zyrex --texture-trace --vram-profile 8gb_1024 --texture-flow-autocast checkpoint --output-dir outputs\texture-ablation\checkpoint_flow
+& C:\dev\TRELLIS.2\.venv\Scripts\python.exe scripts\texture_diagnostics.py `
+  --report baseline_512=outputs\texture-ablation\baseline_512\metrics.json `
+  --report baseline_1024=outputs\texture-ablation\baseline_1024\metrics.json `
+  --report decoder_fp32=outputs\texture-ablation\decoder_fp32\metrics.json `
+  --report checkpoint_flow=outputs\texture-ablation\checkpoint_flow\metrics.json
+```
+
+The comparison prints raw metallic min/mean/std, baked ratios, flow/decoder
+precision and whether decoder input bytes **and coordinates** match the 1024
+baseline. Only attribute a decoder-only difference to precision if those inputs
+match. A 512 input is not expected to match 1024. OOM/failed runs are not passing
+quality results. No GPU ablations were run by the agent; no metallic correction
+has been validated. The existing `gpu_regression` test remains the acceptance gate.

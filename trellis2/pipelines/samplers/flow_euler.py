@@ -90,6 +90,7 @@ class FlowEulerSampler(Sampler):
         rescale_t: float = 1.0,
         verbose: bool = True,
         tqdm_desc: str = "Sampling",
+        retain_history: bool = True,
         **kwargs
     ):
         """
@@ -103,6 +104,7 @@ class FlowEulerSampler(Sampler):
             rescale_t: The rescale factor for t.
             verbose: If True, show a progress bar.
             tqdm_desc: A customized tqdm desc.
+            retain_history: Keep per-step predictions (default True). Disable for inference to save memory.
             **kwargs: Additional arguments for model_inference.
 
         Returns:
@@ -120,8 +122,9 @@ class FlowEulerSampler(Sampler):
         for t, t_prev in tqdm(t_pairs, desc=tqdm_desc, disable=not verbose):
             out = self.sample_once(model, sample, t, t_prev, cond, **kwargs)
             sample = out.pred_x_prev
-            ret.pred_x_t.append(out.pred_x_prev)
-            ret.pred_x_0.append(out.pred_x_0)
+            if retain_history:
+                ret.pred_x_t.append(out.pred_x_prev)
+                ret.pred_x_0.append(out.pred_x_0)
         ret.samples = sample
         return ret
 
