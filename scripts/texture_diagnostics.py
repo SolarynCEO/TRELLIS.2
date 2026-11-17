@@ -115,6 +115,11 @@ def trace_texture(pipeline, report):
 
     def conditioning(original_method):
         def call(image, resolution, *args, **kwargs):
+            import torch
+            encoder = getattr(pipeline.image_cond_model, 'model', pipeline.image_cond_model)
+            report[f'conditioning_precision_{resolution}'] = dict(
+                parameter_dtypes=sorted({str(p.dtype) for p in encoder.parameters()}),
+                autocast_enabled=torch.is_autocast_enabled(torch.device(pipeline.device).type))
             result = original_method(image, resolution, *args, **kwargs)
             report[f'conditioning_{resolution}'] = {
                 key: dict(sha256=tensor_fingerprint(value), moments=tensor_stats(value))

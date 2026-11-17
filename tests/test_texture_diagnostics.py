@@ -112,6 +112,8 @@ def test_compare_cli_rejects_invalid_modes(monkeypatch):
     monkeypatch.delenv('ZYREX_LOW_VRAM_DTYPE', raising=False)
     base = ['--image', 'fixture.png', '--output-dir', 'out', '--texture-compare-only']
     assert parse_args(base).texture_trace
+    assert parse_args(base).texture_resolution is None
+    assert parse_args(base + ['--texture-resolution', '512']).texture_resolution == 512
     assert parse_args(base + ['--vram-profile', 'none', '--low-vram', 'off']).texture_compare_only
     for extra in (['--vram-profile', '8gb'], ['--vram-profile', 'none'],
                   ['--texture-decoder-dtype', 'fp32'], ['--texture-flow-autocast', 'checkpoint']):

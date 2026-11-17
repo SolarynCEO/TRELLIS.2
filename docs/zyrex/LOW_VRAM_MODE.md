@@ -1,5 +1,83 @@
 # TRELLIS.2 Low-VRAM Profiles for Zyrex Fork
 
+## FP32 conditioning and optional 512 texture flow on 1024 shapes
+
+`8gb_1024` now runs **both image-conditioning resolutions in fp32 with autocast
+explicitly disabled**, through final feature normalization and conditioning-token
+creation. Encoder parameters/buffers are temporarily converted to fp32 and their
+original dtypes restored on success or failure. CPU offloading remains enabled.
+Flow sampling and decoder precision are unchanged. Profile-off and legacy `8gb`
+behavior are unchanged. Traces include actual encoder parameter dtypes and
+autocast state under `conditioning_precision_512` / `conditioning_precision_1024`.
+
+User laptop results at 29676ee: upstream compare-only completed in 5276 s,
+low_vram=false, no autocast; raw metallic min/mean/std/max was
+**-0.23251 / 0.98310 / 0.11245 / 1.04567**, versus optimized
+**0.96932 / 0.99913 / 0.00183 / 1.02200**. The first divergence was positive
+512 conditioning (maximum channel-mean difference 6.07e-4), followed by different
+token sets (13299 versus 13321). This establishes upstream metallic bias and
+motivates the conditioning change; it does not establish that conditioning alone
+caused every downstream difference.
+
+Validation targets for the new code are the upstream conditioning hash prefix
+`1a5289d1`, 13299 tokens / coordinate hash prefix `b7691c70`, raw metallic moving
+toward upstream, and **at most 6.5 GiB PyTorch peak reserved through bake/export**.
+These are targets, **not measured results for this change**. Shape-flow precision
+still differs from upstream, so later matching is not guaranteed. Full hashes
+should be compared with the saved upstream report; prefixes are identification
+only. GPU validation remains pending; CPU tests cannot establish memory fit.
+
+Optional `--texture-resolution 512` (API `texture_resolution=512`) selects the
+512 texture flow and its 512 image-conditioning tokens on the **unchanged 1024
+shape latent/coordinates**. It does not rescale, reindex or regenerate the shape,
+change normalization, replace the decoder or change texture-map pixel dimensions.
+This is an experimental use of the 512 checkpoint outside its usual spatial
+distribution. Its material quality and memory use require measurement. Omit the
+option for the existing 1024 texture flow; `--texture-resolution 1024` is explicit
+equivalent selection. It is supported only with 1024 cascade. Run metrics record
+the selected texture resolution/model and actual output resolution separately.
+
+After updating the PR branch, use these PowerShell commands for full runs so the
+reported peak includes bake/export. Reuse the same cached model, seed and image:
+
+```powershell
+Set-Location C:\dev\TRELLIS.2
+git fetch origin feat/low-vram-1024
+git switch feat/low-vram-1024
+git pull --ff-only origin feat/low-vram-1024
+Remove-Item Env:CUDA_VISIBLE_DEVICES -ErrorAction SilentlyContinue
+Remove-Item Env:ZYREX_LOW_VRAM_DTYPE -ErrorAction SilentlyContinue
+$env:ZYREX_RASTER_IMPL = 'triton'
+$python = 'C:\dev\TRELLIS.2\.venv\Scripts\python.exe'
+$model = 'C:\Users\Dakota\.cache\huggingface\hub\models--microsoft--TRELLIS.2-4B\snapshots\af44b45f2e35a493886929c6d786e563ec68364d'
+& $python scripts\profile_1024_vram.py --model-id $model `
+  --image C:\dev\bench\warlord_reference.jpg --seed 42 --vram-profile 8gb_1024 `
+  --max-num-tokens 49152 --decoder-chunk-size 32768 --baker zyrex `
+  --texture-size 2048 --decimation-target 500000 --texture-trace `
+  --output-dir C:\dev\bench\fp32_conditioning_1024tex
+& $python scripts\profile_1024_vram.py --model-id $model `
+  --image C:\dev\bench\warlord_reference.jpg --seed 42 --vram-profile 8gb_1024 `
+  --max-num-tokens 49152 --decoder-chunk-size 32768 --baker zyrex `
+  --texture-size 2048 --decimation-target 500000 --texture-trace `
+  --texture-resolution 512 --output-dir C:\dev\bench\fp32_conditioning_512tex
+& $python scripts\compare_texture_predictions.py `
+  --upstream C:\dev\bench\texture_compare_upstream\metrics.json `
+  --optimized C:\dev\bench\fp32_conditioning_1024tex\metrics.json `
+  --output C:\dev\bench\fp32_conditioning_diff.json
+$report = Get-Content C:\dev\bench\fp32_conditioning_1024tex\metrics.json -Raw | ConvertFrom-Json
+$report | Select-Object status, target_met, `
+  @{Name='AllocatedGiB';Expression={$_.peak_vram_allocated_bytes / 1GB}}, `
+  @{Name='ReservedGiB';Expression={$_.peak_vram_reserved_bytes / 1GB}}
+$report.texture_trace.conditioning_512.cond.sha256
+$report.run_metrics.num_tokens_1024
+$report.texture_trace.shape_slat.coords_sha256
+$report.texture_trace.raw_decoder_output.channels[3]
+```
+
+Either run also accepts `--texture-compare-only` to skip mesh/bake; its
+`target_met` remains null and its peak cannot validate full-generation headroom.
+No channel swaps, clamping, asset-specific behavior or new dependencies are used.
+
 ## Upstream versus optimized texture-only diagnostic
 
 `scripts/profile_1024_vram.py --texture-compare-only` runs 1024 cascade through
@@ -278,8 +356,9 @@ The opt-in profile:
   `decoder_chunk_size=32768` is the default; override with the runtime argument or
   `ZYREX_DECODER_CHUNK_SIZE`. Sparse convolutions, their caches, and mesh extraction
   remain whole to preserve neighborhood/topology correctness.
-- Keeps decoder precision as configured in the checkpoint. Flow/conditioning
-  autocast defaults to fp16, as in `8gb`; `ZYREX_LOW_VRAM_DTYPE=none|fp16|bf16`
+- Keeps decoder precision as configured in the checkpoint. Flow
+  autocast defaults to fp16, as in `8gb`; image conditioning uses fp32 with
+  autocast disabled. `ZYREX_LOW_VRAM_DTYPE=none|fp16|bf16`
   controls it. Cascade upsampling runs without flow autocast to avoid a flex_gemm
   fp32/fp16 operand mismatch. Numerical/visual parity still needs real validation.
 - Rejects multiple samples, conflicting pipeline types, invalid chunk sizes, and

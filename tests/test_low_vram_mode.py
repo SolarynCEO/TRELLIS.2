@@ -197,7 +197,7 @@ def _build_pipeline(pipeline_cls, low_vram: bool = False):
         tex_slat_sampler_params={},
         shape_slat_normalization={"std": [1.0, 1.0], "mean": [0.0, 0.0]},
         tex_slat_normalization={"std": [1.0, 1.0], "mean": [0.0, 0.0]},
-        image_cond_model=types.SimpleNamespace(to=lambda *_: None, cpu=lambda: None, image_size=512, __call__=lambda *_: torch.zeros((1, 4))),
+        image_cond_model=types.SimpleNamespace(model=nn.Linear(2, 2), to=lambda *_: None, cpu=lambda: None, image_size=512, __call__=lambda *_: torch.zeros((1, 4))),
         rembg_model=types.SimpleNamespace(to=lambda *_: None, cpu=lambda: None, __call__=lambda image: image.convert("RGBA")),
         low_vram=low_vram,
     )
@@ -651,3 +651,40 @@ def test_shape_decoder_skip_mesh_preserves_guidance(monkeypatch, pipeline_cls):
         pytest.fail('native mesh conversion must not run')
     monkeypatch.setattr(fdg_vae, 'flexible_dual_grid_to_mesh', forbidden)
     assert decoder(None, skip_mesh=True, return_subs=True) == ('raw', guidance)
+
+
+@pytest.mark.parametrize('texture_resolution', [None, 512, 1024])
+def test_1024_fp32_conditioning_and_texture_flow_selection(monkeypatch, pipeline_cls, texture_resolution):
+    pipeline, _ = _synthetic_1024(monkeypatch, pipeline_cls)
+    seen = []
+    def conditioning(images, resolution):
+        assert not torch.is_autocast_enabled('cpu')
+        assert all(p.dtype == torch.float32 for p in pipeline.image_cond_model.model.parameters())
+        seen.append(resolution)
+        return {'cond': torch.tensor([[float(resolution)]])}
+    pipeline.get_cond = conditioning
+    shape = types.SimpleNamespace(coords=torch.tensor([[0, 7, 9, 11]], dtype=torch.int32))
+    pipeline.sample_shape_slat = lambda *args: shape
+    def texture(cond, model, actual_shape, params):
+        selected = texture_resolution or 1024
+        assert actual_shape is shape  # No resampling of the 1024 shape or coords.
+        assert model is pipeline.models[f'tex_slat_flow_model_{selected}']
+        assert cond['cond'].item() == selected
+        return 'texture latent'
+    pipeline.sample_tex_slat = texture
+    with torch.autocast('cpu', dtype=torch.bfloat16):
+        _, stats = pipeline.run(Image.new('RGB', (8, 8)), vram_profile='8gb_1024',
+                                texture_resolution=texture_resolution, return_metrics=True)
+    assert seen == [512, 1024]
+    assert stats['output_resolution'] == 1024
+    assert stats['texture_resolution'] == (texture_resolution or 1024)
+    assert stats['conditioning_precision'] == 'fp32_autocast_off'
+
+
+def test_texture_resolution_rejects_invalid_values(monkeypatch, pipeline_cls):
+    pipeline, _ = _synthetic_1024(monkeypatch, pipeline_cls)
+    for resolution in (256, True):
+        with pytest.raises(ValueError, match='texture_resolution'):
+            pipeline.run(Image.new('RGB', (8, 8)), vram_profile='8gb_1024', texture_resolution=resolution)
+    with pytest.raises(ValueError, match='1024_cascade'):
+        pipeline.run(Image.new('RGB', (8, 8)), vram_profile='8gb', texture_resolution=512)

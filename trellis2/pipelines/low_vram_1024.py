@@ -9,13 +9,20 @@ import time
 import torch
 
 from ..representations import MeshWithVoxel
-from ..utils.memory import StageProfiler, chunk_ranges
+from ..utils.memory import StageProfiler, chunk_ranges, fp32_conditioning
 
 
 def run_1024(pipeline, image, *, profile_name, pipeline_type, num_samples, seed,
              preprocess_image, return_latent, return_metrics, max_num_tokens,
-             decoder_chunk_size, sparse_params, shape_params, tex_params, texture_compare_only=False):
+             decoder_chunk_size, sparse_params, shape_params, tex_params, texture_compare_only=False,
+             texture_resolution=None):
     optimized = profile_name == '8gb_1024'
+    if texture_resolution is not None and (isinstance(texture_resolution, bool) or texture_resolution not in (512, 1024)):
+        raise ValueError('texture_resolution must be 512 or 1024')
+    texture_resolution = 1024 if texture_resolution is None else texture_resolution
+    texture_model = f'tex_slat_flow_model_{texture_resolution}'
+    if texture_model not in pipeline.models:
+        raise ValueError(f'Missing requested texture flow model: {texture_model}')
     if texture_compare_only and return_latent:
         raise ValueError('texture_compare_only returns diagnostics, not retained latents')
     if profile_name not in (None, '8gb_1024'):
@@ -36,6 +43,8 @@ def run_1024(pipeline, image, *, profile_name, pipeline_type, num_samples, seed,
     cuda_active = pipeline._is_cuda_runtime_active()
     profiler = StageProfiler(pipeline.device, cuda_active=cuda_active, empty_cache=optimized)
     stats = dict(vram_profile=profile_name, pipeline_type='1024_cascade',
+                 texture_resolution=texture_resolution, texture_flow_model=texture_model,
+                 conditioning_precision='fp32_autocast_off' if optimized else 'upstream',
                  output_resolution=None, low_vram=bool(optimized or pipeline.low_vram),
                  device=str(pipeline.device), max_num_tokens=token_limit,
                  decoder_chunk_size=decoder_chunk_size if optimized else None,
@@ -99,8 +108,13 @@ def run_1024(pipeline, image, *, profile_name, pipeline_type, num_samples, seed,
         if preprocess_image:
             image = stage('preprocess_image', lambda: pipeline.preprocess_image(image))
         torch.manual_seed(seed)
-        cond_512 = stage('condition_512', lambda: pipeline.get_cond([image], 512), True)
-        cond_1024 = stage('condition_1024', lambda: pipeline.get_cond([image], 1024), True)
+        def condition(resolution):
+            if optimized:
+                with fp32_conditioning(pipeline.image_cond_model, pipeline.device):
+                    return pipeline.get_cond([image], resolution)
+            return pipeline.get_cond([image], resolution)
+        cond_512 = stage('condition_512', lambda: condition(512), not optimized)
+        cond_1024 = stage('condition_1024', lambda: condition(1024), not optimized)
         if optimized:
             cond_1024 = {key: value.cpu() for key, value in cond_1024.items()}
             release_cache()
@@ -118,7 +132,11 @@ def run_1024(pipeline, image, *, profile_name, pipeline_type, num_samples, seed,
             low_shape = stage('shape_slat_512', lambda: pipeline.sample_shape_slat(
                 cond_512, pipeline.models['shape_slat_flow_model_512'], coords, shape_params), True)
             if optimized:
-                del cond_512, coords
+                if texture_resolution == 512:
+                    cond_512 = {key: value.cpu() for key, value in cond_512.items()}
+                else:
+                    del cond_512
+                del coords
                 release_cache()
             # Sparse convolution requires matching feature/weight dtypes. Let the
             # decoder use its checkpoint precision; flow autocast is not safe here.
@@ -142,8 +160,13 @@ def run_1024(pipeline, image, *, profile_name, pipeline_type, num_samples, seed,
                 release_cache()
             shape_slat = stage('shape_slat_1024', lambda: pipeline.sample_shape_slat(
                 cond_1024, pipeline.models['shape_slat_flow_model_1024'], coords, shape_params), True)
-        tex_slat = stage('tex_slat_1024', lambda: pipeline.sample_tex_slat(
-            cond_1024, pipeline.models['tex_slat_flow_model_1024'], shape_slat, tex_params), True)
+        texture_cond = cond_1024 if texture_resolution == 1024 else {
+            key: value.to(pipeline.device) for key, value in cond_512.items()}
+        tex_slat = stage(f'tex_slat_{texture_resolution}', lambda: pipeline.sample_tex_slat(
+            texture_cond, pipeline.models[texture_model], shape_slat, tex_params), True)
+        del texture_cond
+        if optimized and texture_resolution == 512:
+            del cond_512
         if optimized:
             del cond_1024, coords
             release_cache()

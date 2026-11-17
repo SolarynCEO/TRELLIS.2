@@ -19,6 +19,8 @@ def parse_args(argv=None):
     parser.add_argument('--max-num-tokens', type=int, default=None)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--texture-size', type=int, default=2048)
+    parser.add_argument('--texture-resolution', type=int, choices=[512, 1024], default=None,
+                        help='Opt-in texture flow selection on the unchanged 1024 shape; default is 1024.')
     parser.add_argument('--decimation-target', type=int, default=500000)
     parser.add_argument('--baker', choices=['nvdiffrast', 'zyrex'], default='nvdiffrast')
     parser.add_argument('--texture-diagnostics', action='store_true',
@@ -32,6 +34,8 @@ def parse_args(argv=None):
     parser.add_argument('--texture-compare-only', action='store_true',
                         help='Trace through texture decode, skipping all mesh extraction and baking.')
     args = parser.parse_args(argv)
+    if args.texture_resolution is not None and args.vram_profile == '8gb':
+        parser.error('--texture-resolution requires 1024_cascade, not the 8gb/512 pipeline')
     if args.texture_compare_only:
         if os.environ.get('ZYREX_LOW_VRAM_DTYPE'):
             parser.error('clear ZYREX_LOW_VRAM_DTYPE for an unmodified texture comparison')
@@ -128,7 +132,7 @@ def main():
                 image, seed=args.seed, pipeline_type='512' if args.vram_profile == '8gb' else '1024_cascade',
                 vram_profile=args.vram_profile, profile_stages=args.vram_profile != '8gb', return_metrics=True,
                 max_num_tokens=args.max_num_tokens, decoder_chunk_size=args.decoder_chunk_size,
-                texture_compare_only=args.texture_compare_only)
+                texture_compare_only=args.texture_compare_only, texture_resolution=args.texture_resolution)
         report['run_metrics'] = metrics
         if args.texture_compare_only:
             report.update(status='ok', diagnostic_only=True, stopped_after='texture_decode')

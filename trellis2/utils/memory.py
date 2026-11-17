@@ -6,6 +6,26 @@ import torch
 import torch.nn.functional as F
 
 
+@contextmanager
+def fp32_conditioning(extractor, device):
+    """Disable ambient autocast through encoder output normalization; restore dtypes."""
+    model = getattr(extractor, 'model', extractor)
+    parameter_dtypes = {name: value.dtype for name, value in model.named_parameters() if value.is_floating_point()}
+    buffer_dtypes = {name: value.dtype for name, value in model.named_buffers() if value.is_floating_point()}
+    try:
+        model.float()
+        with torch.autocast(device_type=torch.device(device).type, enabled=False):
+            yield
+    finally:
+        for name, value in model.named_parameters():
+            if name in parameter_dtypes and value.dtype != parameter_dtypes[name]:
+                value.data = value.data.to(parameter_dtypes[name])
+        for name, value in model.named_buffers():
+            if name in buffer_dtypes and value.dtype != buffer_dtypes[name]:
+                parent, _, leaf = name.rpartition('.')
+                setattr(model.get_submodule(parent) if parent else model, leaf, value.to(buffer_dtypes[name]))
+
+
 def chunk_ranges(length, chunk_size):
     if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size <= 0:
         raise ValueError('decoder_chunk_size must be a positive integer')

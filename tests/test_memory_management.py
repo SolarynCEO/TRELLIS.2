@@ -6,6 +6,28 @@ import torch.nn.functional as F
 from trellis2.utils.memory import StageProfiler, chunk_ranges, chunked_norm_linear, resident_module
 
 
+@pytest.mark.parametrize('fail', [False, True])
+def test_fp32_conditioning_disables_ambient_autocast_and_restores_dtypes(fail):
+    from trellis2.utils.memory import fp32_conditioning
+    from types import SimpleNamespace
+    model = torch.nn.Linear(2, 2).half()
+    model.register_buffer('floating_buffer', torch.ones(1, dtype=torch.float16))
+    model.register_buffer('integer_buffer', torch.ones(1, dtype=torch.int64))
+    with torch.autocast('cpu', dtype=torch.bfloat16):
+        try:
+            with fp32_conditioning(SimpleNamespace(model=model), 'cpu'):
+                assert not torch.is_autocast_enabled('cpu')
+                assert model.weight.dtype == model.floating_buffer.dtype == torch.float32
+                assert model(torch.ones(1, 2)).dtype == torch.float32
+                if fail:
+                    raise RuntimeError('injected failure')
+        except RuntimeError:
+            assert fail
+        assert torch.is_autocast_enabled('cpu')
+    assert model.weight.dtype == model.floating_buffer.dtype == torch.float16
+    assert model.integer_buffer.dtype == torch.int64
+
+
 @pytest.mark.parametrize('length,size,expected', [
     (0, 3, []), (1, 3, [(0, 1)]), (6, 3, [(0, 3), (3, 6)]),
     (7, 3, [(0, 3), (3, 6), (6, 7)]),
